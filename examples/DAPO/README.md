@@ -77,6 +77,30 @@ LOG="$DATA_ROOT/logs/dapo-smoke-megatron-native.log" \
 bash "$S"
 ```
 
+Qwen3-30B-A3B MoE + Megatron-Native EP=8, with MORI flex dispatch from a
+local Megatron-LM tree (same flags as `ENABLE_MORI=true` in
+`examples/qwen3/train_qwen3.sh`):
+
+```bash
+export MEGATRON_PATH=/workspace/Megatron_17/Megatron-LM
+export MODEL_PATH="$DATA_ROOT/models/Qwen3-30B-A3B-Base"
+CONFIG_OVERRIDE=examples/DAPO/configs/dapo_qwen3moe_a3b_ray_megatron_smoke.yaml \
+STEPS=2 \
+MODE=bf16 \
+ENABLE_MORI=true \
+LOG="$DATA_ROOT/logs/dapo-smoke-moe-mori.log" \
+bash "$S"
+```
+
+`MEGATRON_PATH` is prepended to `PYTHONPATH` so actors import that
+`megatron.core`, not a pip wheel. `ENABLE_MORI=true` sets
+`moe_token_dispatcher_type=flex` and `moe_flex_dispatcher_backend=mori`.
+The engine sets `moe_mori_max_tokens_per_rank` from
+`max_tokens_per_gpu` (Megatron's `validate_args` is not used).
+
+Actor-only A2A vs MORI (no Ray/rollout), including MORI v1.2.1 install and
+step-12 Chrome traces: [megatron_moe_dispatcher/README.md](../megatron_moe_dispatcher/README.md).
+
 ## Long run
 
 ```bash
