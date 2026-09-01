@@ -1,4 +1,8 @@
-"""8-GPU Megatron-Native Qwen3-30B-A3B actor smoke: EP=8 A2A or MORI + step profiler."""
+"""Megatron-Native Qwen3-30B-A3B actor smoke: A2A or MORI + step profiler.
+
+EP comes from the ``EP`` env var (set by ``run_actor_smoke.sh``; default is
+world size). Qwen3-30B-A3B has 128 experts, so EP must divide 128 and world.
+"""
 from __future__ import annotations
 
 import os
@@ -57,7 +61,14 @@ MOE_GROUPED_GEMM = os.environ.get("MOE_GROUPED_GEMM", "0") in ("1", "true", "TRU
 def _batch(world: int) -> DataProto:
     b, s = N_ROWS, SEQ_LEN
     prompt = min(PROMPT_LEN, s)
-    ids = torch.randint(10, 1000, (b, s), dtype=torch.long)
+    # Deterministic input so two runs (a2a vs mori) route identically and their
+    # per-rank tokens_per_expert dumps can be diffed. Seed per-rank so ranks
+    # still differ, but each rank is reproducible across runs. Uses a private
+    # generator to avoid perturbing the model's global RNG state.
+    _rank = dist.get_rank() if dist.is_initialized() else 0
+    _seed = int(os.environ.get("SMOKE_DATA_SEED", "1234")) + _rank
+    _g = torch.Generator().manual_seed(_seed)
+    ids = torch.randint(10, 1000, (b, s), dtype=torch.long, generator=_g)
     am = torch.ones(b, s, dtype=torch.long)
     resp = torch.ones(b, s, dtype=torch.long)
     resp[:, :prompt] = 0
@@ -98,6 +109,11 @@ def main() -> None:
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     rank = dist.get_rank()
     world = dist.get_world_size()
+    # ``run_actor_smoke.sh`` exports EP=GPUS_PER_NODE*NNODES (override with
+    # EP=8 for two-node DP=2). Unset -> world size.
+    ep = int(os.environ.get("EP", str(world)))
+    if world % ep != 0:
+        raise ValueError(f"EP={ep} must divide world={world}")
     os.makedirs(PROFILE_DIR, exist_ok=True)
 
     worker = LumenActorWorker(
@@ -122,7 +138,7 @@ def main() -> None:
                         "tensor_model_parallel_size": 1,
                         "pipeline_model_parallel_size": 1,
                         "context_parallel_size": 1,
-                        "expert_model_parallel_size": 8,
+                        "expert_model_parallel_size": ep,
                         "sequence_parallel": False,
                         "moe_grouped_gemm": MOE_GROUPED_GEMM,
                         "moe_permute_fusion": True,
@@ -147,7 +163,7 @@ def main() -> None:
     if rank == 0:
         print(
             f"init_model {time.perf_counter() - t0:.1f}s world={world} "
-            f"dispatcher={DISPATCHER} flex={FLEX_BACKEND} ep=8 "
+            f"dispatcher={DISPATCHER} flex={FLEX_BACKEND} ep={ep} "
             f"seq={SEQ_LEN} rows={N_ROWS} prompt={PROMPT_LEN} "
             f"max_tokens_per_gpu={MAX_TOKENS_PER_GPU}",
             flush=True,
@@ -216,7 +232,10 @@ def main() -> None:
         if rank == 0:
             print(table, flush=True)
             print(f"chrome trace (step {PROFILE_STEP}): {trace}", flush=True)
-            print(f"PASS: 8-GPU Megatron-Native MoE {TRACE_TAG} actor smoke", flush=True)
+            print(
+                f"PASS: world={world} EP={ep} Megatron-Native MoE {TRACE_TAG} actor smoke",
+                flush=True,
+            )
 
     dist.destroy_process_group()
 

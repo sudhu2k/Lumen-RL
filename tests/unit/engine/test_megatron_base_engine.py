@@ -116,3 +116,20 @@ def test_moe_dispatcher_kwargs_mori_scales_for_cp_and_sp() -> None:
     )
     # ceil(2048/2)=1024 for CP, then ceil(1024/2)=512 for SP.
     assert kwargs["moe_mori_max_tokens_per_rank"] == 512
+
+
+def test_moe_dispatcher_kwargs_mori_explicit_heap_and_kernel() -> None:
+    kwargs = moe_dispatcher_kwargs(
+        {
+            "moe_token_dispatcher_type": "flex",
+            "moe_flex_dispatcher_backend": "mori",
+            "moe_mori_max_tokens_per_rank": 4096,
+            "moe_mori_kernel_type": "intranode",
+        },
+        tp=2,
+        cp=2,
+        sp=True,
+        max_tokens_per_gpu=2048,
+    )
+    assert kwargs["moe_mori_max_tokens_per_rank"] == 4096
+    assert kwargs["moe_mori_kernel_type"] == "intranode"

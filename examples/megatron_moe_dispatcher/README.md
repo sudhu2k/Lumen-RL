@@ -122,6 +122,15 @@ python3 -m torch.distributed.run --nproc_per_node=8 --master_port=29568 \
 
 Or: `bash examples/megatron_moe_dispatcher/run_actor_smoke.sh mori`
 
+Two nodes (world=16, default EP=16). Same command on every host; only `NODE_RANK` differs:
+
+```bash
+NNODES=2 NODE_RANK=0 MASTER_ADDR=<node0-ip> bash examples/megatron_moe_dispatcher/run_actor_smoke.sh mori
+NNODES=2 NODE_RANK=1 MASTER_ADDR=<node0-ip> bash examples/megatron_moe_dispatcher/run_actor_smoke.sh mori
+```
+
+`EP=8` on two nodes keeps expert-parallel width at 8 and uses DP=2. `MORI_SHMEM_HEAP_SIZE` defaults to `4G` in the launcher.
+
 Leave `CUDA_VISIBLE_DEVICES` set to `0,1,...,7` **before** `import lumenrl.workers.actor_worker`. If it is unset, `base_worker` calls Ray to discover GPUs and eight ranks each start a local Ray cluster.
 
 ## 5. Outputs
