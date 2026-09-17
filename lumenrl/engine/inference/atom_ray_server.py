@@ -48,6 +48,7 @@ class ATOMRayServer:
         kwargs.setdefault("port", self._get_free_port())
         self._pin_cudagraph_mode(kwargs)
         self._pin_sleep_keeps_memory_resident(kwargs)
+        self._pin_rollout_perfetto(kwargs)
         self.engine = AsyncLLMEngine(**kwargs)
         logger.info(
             "ATOMRayServer[%d]: AsyncLLMEngine ready (master=%s:%s online_quant=%s).",
@@ -548,6 +549,37 @@ class ATOMRayServer:
             socket.close()
             ctx.term()
 
+    def _pin_rollout_perfetto(self, kwargs: dict[str, Any]) -> None:
+        from lumenrl.engine.inference.rollout_perfetto import replica_trace_dir
+
+        trace_dir = replica_trace_dir("atom", self.replica_rank)
+        if trace_dir is None:
+            return
+        kwargs.setdefault("torch_profiler_dir", trace_dir)
+        logger.info(
+            "ATOMRayServer[%d]: torch_profiler_dir=%s",
+            self.replica_rank,
+            kwargs["torch_profiler_dir"],
+        )
+
+    async def start_profile(self) -> bool:
+        from lumenrl.engine.inference.rollout_perfetto import replica_should_trace
+
+        if self.engine is None or not replica_should_trace(self.replica_rank):
+            return False
+        self.engine.start_profile()
+        logger.info("ATOMRayServer[%d]: start_profile", self.replica_rank)
+        return True
+
+    async def stop_profile(self) -> Any:
+        from lumenrl.engine.inference.rollout_perfetto import replica_should_trace
+
+        if self.engine is None or not replica_should_trace(self.replica_rank):
+            return None
+        result = self.engine.stop_profile()
+        logger.info("ATOMRayServer[%d]: stop_profile %s", self.replica_rank, result)
+        return result
+
     async def sleep(self, level: int = 2) -> bool:
         if self.engine is not None and hasattr(self.engine, "sleep"):
             self.engine.sleep(level=level)
@@ -688,6 +720,8 @@ class ATOMReplicaManager:
                 "ATOM_FORCE_ATTN_TRITON",
                 "VERL_ATOM_AGENT_LOG",
                 "VERL_MEMORY_AGENT_LOG",
+                "LUMENRL_ROLLOUT_PERFETTO_DIR",
+                "LUMENRL_ROLLOUT_PERFETTO_REPLICA",
             ):
                 if key in os.environ:
                     env_vars[key] = os.environ[key]
@@ -779,6 +813,14 @@ class ATOMReplicaManager:
             comp_cfg["cache_dir"],
         )
         return kwargs
+
+    def start_profile_all(self) -> None:
+        import ray
+        ray.get([s.start_profile.remote() for s in self.servers])
+
+    def stop_profile_all(self) -> None:
+        import ray
+        ray.get([s.stop_profile.remote() for s in self.servers])
 
     def sleep_all(self, level: int = 2) -> None:
         import ray

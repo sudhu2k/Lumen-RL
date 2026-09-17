@@ -80,7 +80,18 @@ class VLLMHttpEngine:
         prompt_token_ids_list: list[list[int]],
         sampling_params: dict[str, Any],
     ) -> list[dict[str, Any]]:
-        return self.client.generate(prompt_token_ids_list, sampling_params)
+        from lumenrl.engine.inference.rollout_perfetto import rollout_perfetto_enabled
+
+        profile = rollout_perfetto_enabled() and hasattr(self.manager, "start_profile_all")
+        if profile:
+            logger.info("Rollout Perfetto: start_profile around generate (%d prompts)", len(prompt_token_ids_list))
+            self.manager.start_profile_all()
+        try:
+            return self.client.generate(prompt_token_ids_list, sampling_params)
+        finally:
+            if profile:
+                self.manager.stop_profile_all()
+                logger.info("Rollout Perfetto: stop_profile complete")
 
     # -- memory management (verl sleep/wake) -----------------------------
     def sleep(self, level: Optional[int] = None) -> None:

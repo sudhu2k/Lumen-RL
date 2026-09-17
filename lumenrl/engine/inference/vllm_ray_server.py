@@ -49,6 +49,8 @@ _VLLM_RUNTIME_ENV_KEYS = (
     "LUMENRL_DIAG_ALL_GATHER",
     "LUMENRL_DIAG_ALL_GATHER_NUMEL",
     "LUMENRL_WEIGHT_SYNC_INTEGRITY",
+    "LUMENRL_ROLLOUT_PERFETTO_DIR",
+    "LUMENRL_ROLLOUT_PERFETTO_REPLICA",
 )
 
 
@@ -93,6 +95,7 @@ class VLLMRayServer:
         if self.base_seed is not None and "seed" not in self.engine_kwargs:
             self.engine_kwargs["seed"] = int(self.base_seed) + self.replica_rank
 
+        self._pin_rollout_perfetto()
         worker_ext = "lumenrl.engine.inference.vllm_colocate_worker_ext.vLLMColocateWorkerExtension"
         args = AsyncEngineArgs(
             model=self.model_name,
@@ -161,6 +164,41 @@ class VLLMRayServer:
         self._http_task = asyncio.create_task(server.serve())
         self._http_ready = True
         logger.info("VLLMRayServer[%d]: HTTP on :%d", self.replica_rank, self.http_port)
+
+    def _pin_rollout_perfetto(self) -> None:
+        from lumenrl.engine.inference.rollout_perfetto import replica_trace_dir
+
+        trace_dir = replica_trace_dir("vllm", self.replica_rank)
+        if trace_dir is None:
+            return
+        cfg = dict(self.engine_kwargs.get("profiler_config") or {})
+        cfg.setdefault("profiler", "torch")
+        cfg.setdefault("torch_profiler_dir", trace_dir)
+        cfg.setdefault("torch_profiler_with_stack", False)
+        self.engine_kwargs["profiler_config"] = cfg
+        logger.info(
+            "VLLMRayServer[%d]: profiler_config.torch_profiler_dir=%s",
+            self.replica_rank,
+            cfg["torch_profiler_dir"],
+        )
+
+    async def start_profile(self) -> bool:
+        from lumenrl.engine.inference.rollout_perfetto import replica_should_trace
+
+        if self.engine is None or not replica_should_trace(self.replica_rank):
+            return False
+        await self.engine.start_profile(profile_prefix=f"r3_rollout_replica{self.replica_rank}")
+        logger.info("VLLMRayServer[%d]: start_profile", self.replica_rank)
+        return True
+
+    async def stop_profile(self) -> bool:
+        from lumenrl.engine.inference.rollout_perfetto import replica_should_trace
+
+        if self.engine is None or not replica_should_trace(self.replica_rank):
+            return False
+        await self.engine.stop_profile()
+        logger.info("VLLMRayServer[%d]: stop_profile", self.replica_rank)
+        return True
 
     def ready(self) -> bool:
         return self.engine is not None
@@ -591,6 +629,14 @@ class VLLMReplicaManager:
         return kwargs
 
     # -- fan-out helpers -------------------------------------------------
+    def start_profile_all(self) -> None:
+        import ray
+        ray.get([s.start_profile.remote() for s in self.servers])
+
+    def stop_profile_all(self) -> None:
+        import ray
+        ray.get([s.stop_profile.remote() for s in self.servers])
+
     def sleep_all(self, level: int = 2) -> None:
         import ray
         ray.get([s.sleep.remote(level) for s in self.servers])
