@@ -576,6 +576,8 @@ class RLTrainer:
         extra = getattr(atom_cfg, "engine_kwargs", {}) or {}
         if extra:
             engine_kwargs.update(dict(extra))
+        if bool(getattr(self.config.moe.r3, "enabled", False)):
+            engine_kwargs["enable_return_routed_experts"] = True
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
@@ -677,9 +679,10 @@ class RLTrainer:
                 raw_routes = res.get("routed_experts")
                 if raw_routes is None:
                     raise RuntimeError(
-                        "moe.r3.enabled=true but vLLM returned no routed_experts. "
-                        "The rollout image must include the MILES vLLM patch and "
-                        "enable_return_routed_experts support."
+                        "moe.r3.enabled=true but the rollout engine returned no "
+                        "routed_experts. vLLM and ATOM both need "
+                        "enable_return_routed_experts; ATOM generate() must "
+                        "forward the field through ATOMRayServer."
                     )
                 routes = torch.as_tensor(raw_routes)
                 expected = len(p_ids) + len(g_ids) - 1
@@ -688,7 +691,7 @@ class RLTrainer:
                     routes = routes[:expected]
                 if routes.ndim != 3 or routes.shape[0] != expected:
                     raise ValueError(
-                        "vLLM routed_experts shape mismatch: expected "
+                        "routed_experts shape mismatch: expected "
                         f"[{expected}, num_layers, top_k], got {tuple(routes.shape)}"
                     )
                 response_routes.append(routes.to(dtype=torch.int16, device="cpu"))

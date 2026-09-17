@@ -227,6 +227,28 @@ class ATOMRayServer:
             sp_kwargs = {k: v for k, v in sp_kwargs.items() if k in fields}
         return SamplingParams(**sp_kwargs)
 
+    @staticmethod
+    def _completion_dict(out: Any, prompt_ids: list[int]) -> dict[str, Any]:
+        """Map ATOM ``LLMEngine.generate`` output onto the Ray completion dict.
+
+        ``routed_experts`` is optional: present when
+        ``enable_return_routed_experts`` is on, otherwise omitted so R3-off
+        rollouts stay unchanged.
+        """
+        payload = out if isinstance(out, dict) else {}
+        token_ids = list(payload.get("token_ids", []) or [])
+        logprobs = payload.get("logprobs")
+        result: dict[str, Any] = {
+            "text": payload.get("text", ""),
+            "prompt_token_ids": list(prompt_ids),
+            "token_ids": token_ids,
+            "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
+        }
+        routes = payload.get("routed_experts")
+        if routes is not None:
+            result["routed_experts"] = routes
+        return result
+
     async def generate(
         self,
         prompt: list[int],
@@ -244,14 +266,7 @@ class ATOMRayServer:
             return self.engine.generate([prompt_ids], sp, request_ids=[rid])[0]
 
         out = await asyncio.get_event_loop().run_in_executor(None, _generate_blocking)
-        token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
-        logprobs = out.get("logprobs") if isinstance(out, dict) else None
-        return {
-            "text": out.get("text", "") if isinstance(out, dict) else "",
-            "prompt_token_ids": prompt_ids,
-            "token_ids": token_ids,
-            "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
-        }
+        return self._completion_dict(out, prompt_ids)
 
     async def generate_batch(
         self,
@@ -286,14 +301,7 @@ class ATOMRayServer:
         results: list[dict[str, Any]] = []
         expanded_prompts = [p for p, n in zip(grouped_prompts, grouped_counts) for _ in range(n)]
         for p_ids, out in zip(expanded_prompts, outs):
-            token_ids = list(out.get("token_ids", [])) if isinstance(out, dict) else []
-            logprobs = out.get("logprobs") if isinstance(out, dict) else None
-            results.append({
-                "text": out.get("text", "") if isinstance(out, dict) else "",
-                "prompt_token_ids": p_ids,
-                "token_ids": token_ids,
-                "logprobs": [float(x) for x in logprobs] if logprobs is not None else None,
-            })
+            results.append(self._completion_dict(out, p_ids))
         return results
 
     async def update_weights_from_ipc(

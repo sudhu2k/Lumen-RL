@@ -1,6 +1,6 @@
-"""Production R3 is vLLM + hard-assignment expert ids only.
+"""Production R3 is hard-assignment expert ids from vLLM or ATOM.
 
-``assert_supported_r3`` fail-closes ATOM rollout and ``replay_mode=distribution``.
+``assert_supported_r3`` fail-closes ``replay_mode=distribution``.
 Do not import this from ``lumenrl.moe`` inside ``lumenrl.core.config`` — import
 this module directly so config load does not cycle through ``R3Manager``.
 """
@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
-SUPPORTED_R3_GENERATION_BACKEND = "vllm"
+SUPPORTED_R3_GENERATION_BACKENDS = ("vllm", "atom")
 SUPPORTED_R3_REPLAY_MODE = "hard_assignment"
 
 
@@ -45,20 +45,31 @@ def r3_fields_from_config(config: Any) -> tuple[bool, str, str]:
 
 
 def assert_supported_r3(*, replay_mode: str, generation_backend: str) -> None:
-    """Raise unless this enabled R3 job is vLLM hard-assignment.
+    """Raise unless this enabled R3 job is vLLM or ATOM hard-assignment.
 
     Call only when ``moe.r3.enabled`` (or equivalent) is already true.
     """
     backend = (generation_backend or "").strip().lower()
     mode = (replay_mode or "").strip().lower()
-    if backend != SUPPORTED_R3_GENERATION_BACKEND:
+    if backend not in SUPPORTED_R3_GENERATION_BACKENDS:
         raise RuntimeError(
-            "moe.r3.enabled=true requires policy.generation_backend=vllm; "
-            f"got {generation_backend!r}. ATOM R3 is not supported yet."
+            "moe.r3.enabled=true requires policy.generation_backend in "
+            f"{SUPPORTED_R3_GENERATION_BACKENDS}; got {generation_backend!r}."
         )
     if mode != SUPPORTED_R3_REPLAY_MODE:
         raise RuntimeError(
             "moe.r3.enabled=true requires moe.r3.replay_mode=hard_assignment; "
             f"got {replay_mode!r}. Distribution replay is not supported yet "
-            "(vLLM does not return router logits)."
+            "(rollout engines return expert ids, not router logits)."
         )
+
+
+def assert_supported_r3_config(config: Any) -> None:
+    """Validate R3 backend/mode only when R3 is enabled."""
+    enabled, replay_mode, generation_backend = r3_fields_from_config(config)
+    if not enabled:
+        return
+    assert_supported_r3(
+        replay_mode=replay_mode,
+        generation_backend=generation_backend,
+    )

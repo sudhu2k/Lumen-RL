@@ -45,6 +45,30 @@ def test_an_explicit_setting_wins() -> None:
     assert kwargs["sleep_keeps_memory_resident"] is False
 
 
+def test_completion_dict_forwards_routed_experts() -> None:
+    import numpy as np
+
+    routes = np.zeros((3, 2, 2), dtype=np.int16)
+    out = ATOMRayServer._completion_dict(
+        {
+            "text": "hi",
+            "token_ids": [1, 2],
+            "logprobs": [0.1, 0.2],
+            "routed_experts": routes,
+        },
+        [9],
+    )
+    assert out["prompt_token_ids"] == [9]
+    assert out["token_ids"] == [1, 2]
+    assert out["logprobs"] == [0.1, 0.2]
+    assert out["routed_experts"] is routes
+
+
+def test_completion_dict_omits_routes_when_absent() -> None:
+    out = ATOMRayServer._completion_dict({"token_ids": [1]}, [0])
+    assert "routed_experts" not in out
+
+
 def test_the_shared_gate_reads_both_ways_of_asking_for_torch_compile() -> None:
     # run_dapo.sh passes enforce_eager=false *and* compilation_config.level=3 for
     # ATOM FP8; either alone still means graphs will be captured.

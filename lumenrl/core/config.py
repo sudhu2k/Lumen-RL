@@ -646,8 +646,8 @@ class QuantizationConfig:
 
 @dataclass
 class R3Config:
-    # Production R3 is vLLM + hard_assignment only. ``assert_supported_r3``
-    # fail-closes ATOM backends and replay_mode=distribution.
+    # Production R3 is hard-assignment expert ids from vLLM or ATOM.
+    # ``assert_supported_r3`` fail-closes replay_mode=distribution.
     enabled: bool = False
     record_router_logits: bool = False
     replay_mode: str = "hard_assignment"
