@@ -241,18 +241,14 @@ quantization:
 
 ## MoE Training with R3
 
-MoE models suffer from routing inconsistency between inference (ATOM) and training (Lumen/Megatron), which can cause catastrophic RL training collapse. LumenRL implements [Rollout Routing Replay (R3)](https://arxiv.org/abs/2510.11370):
-
-1. **Record**: During ATOM rollout, capture router logits and expert assignments at each MoE layer
-2. **Transfer**: Package routing distributions alongside generated sequences in `DataProto`
-3. **Replay**: During Lumen training, inject recorded routing distributions to align with inference behavior
+MoE models suffer from routing inconsistency between inference (vLLM or ATOM) and training (Lumen/Megatron), which can cause catastrophic RL training collapse. LumenRL implements [Rollout Routing Replay (R3)](https://arxiv.org/abs/2510.11370) as **hard-assignment** of expert ids from vLLM or ATOM. `replay_mode: distribution` fail-closes (`assert_supported_r3`).
 
 ```yaml
 moe:
   r3:
     enabled: true
-    record_router_logits: true
-    replay_mode: distribution    # distribution or hard_assignment
+    record_router_logits: false
+    replay_mode: hard_assignment
 ```
 
 R3 significantly reduces training-inference policy KL divergence and prevents collapse without compromising training speed.

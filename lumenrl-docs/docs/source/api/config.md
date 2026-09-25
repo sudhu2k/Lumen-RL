@@ -117,9 +117,9 @@ same = load_config("configs/grpo_dense_bf16.yaml", overrides=["seed=123"])
 
 | `R3Config` field | Default | Description |
 | --- | --- | --- |
-| `enabled` | `False` | Master R3 toggle |
-| `record_router_logits` | `True` | Capture logits during rollout |
-| `replay_mode` | `"distribution"` | `distribution` or `hard_assignment` |
+| `enabled` | `False` | Master R3 toggle (vLLM only; ATOM fail-closes) |
+| `record_router_logits` | `False` | Unused by the expert-id path |
+| `replay_mode` | `"hard_assignment"` | `hard_assignment` only; `distribution` fail-closes |
 
 ### `RewardConfig`, `CheckpointConfig`, `LoggerConfig`, `WandbConfig`
 

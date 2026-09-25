@@ -1,6 +1,14 @@
 # MoE Rollout Routing Replay (R3)
 
-MoE reinforcement learning couples two different code paths: high-throughput inference routers (ATOM) and training-time routers inside Megatron/Lumen. Small numerical and implementation differences can yield different expert assignments for identical tokens, which shows up as unstable KL divergences and collapsed expert utilization.
+MoE reinforcement learning couples two different code paths: high-throughput
+inference routers (vLLM or ATOM) and training-time routers inside Megatron/Lumen.
+Production R3 is **hard_assignment** of expert ids from ``vllm`` or ``atom``.
+``assert_supported_r3`` fail-closes ``replay_mode=distribution``.
+
+Replay consumes MILES expert ids ``[seq_len-1, layers, top_k]`` on
+``rollout_routing`` / ``rollout_routed_experts``. vLLM fills that from
+``CompletionOutput.routed_experts``. ATOM fills it from native
+``LLMEngine.generate()`` when ``enable_return_routed_experts`` is on.
 
 ## Problem statement
 
@@ -14,13 +22,18 @@ The result is **router inconsistency**: the policy gradient is computed against 
 
 ## R3 solution (record / transfer / replay)
 
-R3 implements a three-phase contract:
+Production Ray RL (native Megatron) uses **hard-assignment expert ids**:
 
-1. **Record** — During ATOM rollout, `RouterRecorder` installs forward hooks on detected MoE modules and stores CPU float copies of router logits keyed by layer index.
-2. **Transfer** — `R3Manager.transfer_distributions` copies recorded tensors into `DataProto` using `add_router_distributions`, preserving them across Ray merges.
-3. **Replay** — `RouterReplayer` installs hooks during training forwards to overwrite router outputs with the recorded logits (mode controlled by `replay_mode`).
+1. **Record** — vLLM or ATOM `enable_return_routed_experts`.
+2. **Transfer** — `RLTrainer` packs per-completion `routed_experts` into
+   ragged `rollout_routing`.
+3. **Replay** — `MegatronNativeEngine` injects those ids via Megatron
+   `RouterReplay`.
 
-This aligns expert choice distributions between engines without forcing a single codebase path for inference and training.
+A second, older contract still exists for logit-level replay (unit tests /
+`AtomRolloutWorker`): `RouterRecorder` → `DataProto.router_distributions` →
+`RouterReplayer`. Native Megatron `RouterReplay` does **not** consume that
+payload.
 
 ## Configuration
 
@@ -28,15 +41,15 @@ This aligns expert choice distributions between engines without forcing a single
 moe:
   r3:
     enabled: true
-    record_router_logits: true
-    replay_mode: distribution   # or hard_assignment
+    record_router_logits: false   # expert-id path; true is the logit recorder
+    replay_mode: hard_assignment  # native Megatron RouterReplay
 ```
 
 | Field | Purpose |
 | --- | --- |
-| `enabled` | Master switch for recorder/replayer contexts |
-| `record_router_logits` | When false, record phase becomes a no-op but APIs remain safe |
-| `replay_mode` | `distribution` feeds soft logits; `hard_assignment` can lock discrete decisions when supported |
+| `enabled` | Master switch; Ray rollout attaches `routed_experts` when true |
+| `record_router_logits` | ATOM `RouterRecorder` logit hooks (`AtomRolloutWorker`); unused by native expert-id replay |
+| `replay_mode` | Must be `hard_assignment`. `distribution` fail-closes until vLLM returns router logits. |
 
 Structured types are `MoEConfig` → `R3Config` in {doc}`/api/config`.
 
