@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import deque
 from collections.abc import Iterable
 from typing import Any
 
@@ -45,8 +46,16 @@ def _missing_reloadable_names(
     )
 
 
+def _to_device_from_pinned(values: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # A pageable host-to-device copy blocks the host until the current stream
+    # drains; a pinned non_blocking one does not.
+    return values.pin_memory().to(device, non_blocking=True)
+
+
 def _encode_bucket(
     weights: list[tuple[str, torch.Tensor]],
+    *,
+    pinned_metadata: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not weights:
         raise ValueError("cannot encode an empty weight bucket")
@@ -79,7 +88,11 @@ def _encode_bucket(
         payload[start:end].copy_(value.view(torch.uint8).reshape(-1))
 
     raw_meta = json.dumps(entries, separators=(",", ":")).encode("utf-8")
-    metadata = torch.tensor(list(raw_meta), dtype=torch.uint8, device=device)
+    if pinned_metadata:
+        host = torch.frombuffer(bytearray(raw_meta), dtype=torch.uint8)
+        metadata = _to_device_from_pinned(host, device)
+    else:
+        metadata = torch.tensor(list(raw_meta), dtype=torch.uint8, device=device)
     return metadata, payload
 
 
@@ -91,12 +104,13 @@ def _broadcast_header(
     metadata_bytes: int = 0,
     payload_bytes: int = 0,
     version: int = 0,
-) -> torch.Tensor:
-    header = torch.tensor(
-        [command, metadata_bytes, payload_bytes, version],
-        dtype=torch.int64,
-        device=device,
-    )
+    async_op: bool = False,
+):
+    values = [command, metadata_bytes, payload_bytes, version]
+    if async_op:
+        header = _to_device_from_pinned(torch.tensor(values, dtype=torch.int64), device)
+        return header, dist.broadcast(header, src=0, group=group, async_op=True)
+    header = torch.tensor(values, dtype=torch.int64, device=device)
     dist.broadcast(header, src=0, group=group)
     return header
 
@@ -108,6 +122,7 @@ def send_weight_stream(
     *,
     bucket_size_bytes: int,
     version: int,
+    max_in_flight: int = 0,
 ) -> dict[str, float]:
     """Pack HF-named tensors into bounded GPU buckets and RCCL-broadcast them.
 
@@ -116,9 +131,19 @@ def send_weight_stream(
     CUDA events (a host sync would serialize packing with sending), and
     includes waiting for receivers to post theirs. ``final_sync_s`` is the
     drain after the end marker.
+
+    ``max_in_flight > 0`` posts the broadcasts asynchronously, so the export's
+    gathers and packing of the next buckets run while earlier buckets are on
+    the wire. At most ``max_in_flight`` buckets are posted and not yet waited
+    on; their buffers stay referenced until then. ``bcast_s`` is not measured
+    in this mode (the broadcasts run on the RCCL stream) and reads 0.
     """
     if bucket_size_bytes <= 0:
         raise ValueError("bucket_size_bytes must be positive")
+    if max_in_flight < 0:
+        raise ValueError("max_in_flight must be >= 0")
+    pipelined = max_in_flight > 0
+    in_flight: deque[tuple[list, tuple[torch.Tensor, ...]]] = deque()
     device = torch.device("cuda", torch.cuda.current_device())
     bucket: list[tuple[str, torch.Tensor]] = []
     bucket_bytes = 0
@@ -134,9 +159,45 @@ def send_weight_stream(
         nonlocal bucket, bucket_bytes, total_bytes, total_weights, total_buckets, pack_s
         if not bucket:
             return
+        if pipelined:
+            while len(in_flight) >= max_in_flight:
+                retire_oldest()
         t0 = time.perf_counter()
-        metadata, payload = _encode_bucket(bucket)
+        metadata, payload = _encode_bucket(bucket, pinned_metadata=pipelined)
         pack_s += time.perf_counter() - t0
+        if pipelined:
+            header, header_work = _broadcast_header(
+                group,
+                device=device,
+                command=_CMD_BUCKET,
+                metadata_bytes=metadata.numel(),
+                payload_bytes=payload.numel(),
+                version=version,
+                async_op=True,
+            )
+            works = [
+                header_work,
+                dist.broadcast(metadata, src=0, group=group, async_op=True),
+                dist.broadcast(payload, src=0, group=group, async_op=True),
+            ]
+            in_flight.append((works, (header, metadata, payload)))
+        else:
+            post_sync(metadata, payload)
+        total_bytes += payload.numel()
+        total_weights += len(bucket)
+        total_buckets += 1
+        bucket = []
+        bucket_bytes = 0
+
+    def retire_oldest() -> None:
+        # Makes the current stream wait on the RCCL stream; the host does not
+        # block. Buffers allocated later on the current stream are ordered
+        # after the broadcast, so dropping the references here is safe.
+        works, _ = in_flight.popleft()
+        for work in works:
+            work.wait()
+
+    def post_sync(metadata: torch.Tensor, payload: torch.Tensor) -> None:
         begin = torch.cuda.Event(enable_timing=True)
         end = torch.cuda.Event(enable_timing=True)
         begin.record()
@@ -152,11 +213,6 @@ def send_weight_stream(
         dist.broadcast(payload, src=0, group=group)
         end.record()
         bcast_events.append((begin, end))
-        total_bytes += payload.numel()
-        total_weights += len(bucket)
-        total_buckets += 1
-        bucket = []
-        bucket_bytes = 0
 
     it = iter(weights)
     while True:
@@ -175,8 +231,16 @@ def send_weight_stream(
         if bucket_bytes >= bucket_size_bytes:
             flush()
     flush()
-    _broadcast_header(group, device=device, command=_CMD_END, version=version)
+    if pipelined:
+        end_header, end_work = _broadcast_header(
+            group, device=device, command=_CMD_END, version=version, async_op=True
+        )
+        in_flight.append(([end_work], (end_header,)))
+    else:
+        _broadcast_header(group, device=device, command=_CMD_END, version=version)
     t0 = time.perf_counter()
+    while in_flight:
+        retire_oldest()
     torch.cuda.synchronize(device)
     final_sync_s = time.perf_counter() - t0
     elapsed = time.perf_counter() - started
@@ -207,6 +271,7 @@ def receive_weight_stream(
     fingerprint_tracker=None,
     finalize_fingerprints: bool = True,
     staging: str = "cpu",
+    prefetch: bool = False,
 ) -> dict[str, Any]:
     """Receive RCCL buckets and load them directly into a resident vLLM model.
 
@@ -215,6 +280,10 @@ def receive_weight_stream(
     before returning, as on BF16 and prequantized FP8), ``cpu`` and ``gpu``
     pass copies. Online-FP8 reload holds tensors until a module is complete,
     and a held view would keep its whole payload alive.
+
+    ``prefetch`` posts bucket N+1's metadata and payload broadcasts before
+    bucket N is loaded, so two payloads are alive at once. The collective
+    order is unchanged: header, metadata, payload, next header.
     """
     from lumenrl.engine.inference.vllm_fp8_utils import ReloadFingerprintTracker
 
@@ -242,43 +311,70 @@ def receive_weight_stream(
     total_buckets = 0
     # Host time inside this generator, by phase; whatever load_weights spends
     # outside it is its own loading. Each phase ends in a host sync (header,
-    # metadata, .cpu()), so wall time is the transfer time.
+    # metadata, .cpu()), so wall time is the transfer time. With prefetch,
+    # recv_s is only the part of the transfer not hidden behind the load.
     timing = {"wait_s": 0.0, "recv_s": 0.0, "host_copy_s": 0.0, "observe_s": 0.0}
     started = time.perf_counter()
     last_source: dict[str, Any] | None = None
 
+    def post_bucket(lookahead=None):
+        t0 = time.perf_counter()
+        if lookahead is None:
+            header = _broadcast_header(group, device=device)
+        else:
+            header, header_work = lookahead
+            header_work.wait()
+        command, metadata_bytes, payload_bytes, version = [
+            int(x) for x in header.cpu().tolist()
+        ]
+        timing["wait_s"] += time.perf_counter() - t0
+        if version != expected_version:
+            raise RuntimeError(
+                f"RDMA weight version mismatch: expected {expected_version}, got {version}"
+            )
+        if command == _CMD_END:
+            return None
+        if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
+            raise RuntimeError(f"invalid RDMA weight header: {header.tolist()}")
+        metadata_tensor = torch.empty(metadata_bytes, dtype=torch.uint8, device=device)
+        payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
+        async_kw = {"async_op": True} if prefetch else {}
+        works = [
+            dist.broadcast(metadata_tensor, src=0, group=group, **async_kw),
+            dist.broadcast(payload, src=0, group=group, **async_kw),
+        ]
+        next_header = None
+        if prefetch:
+            # The next header follows this payload on the wire in the
+            # sender's order; posting it now takes its round trip off the
+            # path between buckets.
+            header_buf = torch.empty(_HEADER_WORDS, dtype=torch.int64, device=device)
+            next_header = (
+                header_buf,
+                dist.broadcast(header_buf, src=0, group=group, async_op=True),
+            )
+        return metadata_tensor, payload, works, next_header
+
+    def finish_bucket(pending):
+        metadata_tensor, payload, works, _ = pending
+        t0 = time.perf_counter()
+        if prefetch:
+            for work in works:
+                work.wait()
+        metadata = json.loads(bytes(metadata_tensor.cpu().tolist()).decode("utf-8"))
+        timing["recv_s"] += time.perf_counter() - t0
+        return metadata, payload
+
     def received_weights():
         nonlocal total_bytes, total_weights, total_buckets, last_source
-        while True:
-            t0 = time.perf_counter()
-            header = _broadcast_header(group, device=device)
-            command, metadata_bytes, payload_bytes, version = [
-                int(x) for x in header.cpu().tolist()
-            ]
-            timing["wait_s"] += time.perf_counter() - t0
-            if version != expected_version:
-                raise RuntimeError(
-                    f"RDMA weight version mismatch: expected {expected_version}, got {version}"
-                )
-            if command == _CMD_END:
-                return
-            if command != _CMD_BUCKET or metadata_bytes <= 0 or payload_bytes <= 0:
-                raise RuntimeError(f"invalid RDMA weight header: {header.tolist()}")
-
-            t0 = time.perf_counter()
-            metadata_tensor = torch.empty(
-                metadata_bytes,
-                dtype=torch.uint8,
-                device=device,
-            )
-            payload = torch.empty(payload_bytes, dtype=torch.uint8, device=device)
-            dist.broadcast(metadata_tensor, src=0, group=group)
-            dist.broadcast(payload, src=0, group=group)
-            metadata = json.loads(
-                bytes(metadata_tensor.cpu().tolist()).decode("utf-8")
-            )
-            timing["recv_s"] += time.perf_counter() - t0
-            total_bytes += payload_bytes
+        pending = post_bucket()
+        while pending is not None:
+            metadata, payload = finish_bucket(pending)
+            # A payload is only rewritten by a broadcast posted after the
+            # loader's copies from it were queued, and RCCL orders its stream
+            # after the compute stream at post time.
+            pending = post_bucket(pending[3]) if prefetch else None
+            total_bytes += payload.numel()
             total_weights += len(metadata)
             total_buckets += 1
             for entry in metadata:
@@ -308,6 +404,8 @@ def receive_weight_stream(
                 fingerprints.observe_source([(entry["name"], value)])
                 timing["observe_s"] += time.perf_counter() - t0
                 yield entry["name"], value
+            if not prefetch:
+                pending = post_bucket()
 
     t_load = time.perf_counter()
     try:

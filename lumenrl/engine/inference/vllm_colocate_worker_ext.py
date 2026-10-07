@@ -258,6 +258,7 @@ class vLLMColocateWorkerExtension:
         integrity_enabled = os.environ.get(
             "LUMENRL_WEIGHT_SYNC_INTEGRITY", "0"
         ) == "1"
+        prefetch = os.environ.get("LUMENRL_WEIGHT_SYNC_RDMA_PREFETCH", "0") == "1"
         integrity_reports: dict[str, object] = {}
         if integrity_enabled:
             integrity_reports["before_prepare"] = self.inspect_weight_integrity()
@@ -344,6 +345,7 @@ class vLLMColocateWorkerExtension:
                     fingerprint_tracker=fingerprints,
                     finalize_fingerprints=False,
                     staging=staging,
+                    prefetch=prefetch,
                 )
                 log_static_changes("after_load")
                 if integrity_enabled:
@@ -403,6 +405,7 @@ class vLLMColocateWorkerExtension:
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=True,
                 staging="none",
+                prefetch=prefetch,
             )
         else:
             stats = receive_weight_stream(
@@ -413,6 +416,7 @@ class vLLMColocateWorkerExtension:
                 verify_full_load=bool(verify_full_load),
                 streamed_scales=False,
                 staging="none",
+                prefetch=prefetch,
             )
 
         verification = stats.get("verification", {})

@@ -1095,7 +1095,31 @@ class LumenActorWorker(BaseWorker):
         When ``fp8_quantize=True``, BF16 weights are quantized to FP8 e4m3 with
         per-128x128-block scaling on the actor side before RDMA broadcast. This
         halves transfer size and is compatible with vLLM's ``fp8_per_block`` mode.
+
+        ``LUMENRL_WEIGHT_SYNC_RDMA_PAUSE_GC=1`` disables Python's automatic GC
+        for the duration, so a collection cannot stall the export mid-stream.
         """
+        pause_gc = (
+            os.environ.get("LUMENRL_WEIGHT_SYNC_RDMA_PAUSE_GC", "0") == "1"
+            and gc.isenabled()
+        )
+        if pause_gc:
+            gc.disable()
+        try:
+            return self._send_weights_rdma(
+                version, bucket_size_mb, fp8_quantize, integrity_check
+            )
+        finally:
+            if pause_gc:
+                gc.enable()
+
+    def _send_weights_rdma(
+        self,
+        version: int,
+        bucket_size_mb: int,
+        fp8_quantize: bool,
+        integrity_check: bool,
+    ) -> dict[str, Any]:
         if self._engine is None:
             raise RuntimeError("init_model() must be called before RDMA weight sync")
         torch.cuda.synchronize()
@@ -1136,6 +1160,9 @@ class LumenActorWorker(BaseWorker):
             params,
             bucket_size_bytes=int(bucket_size_mb) * 1024 * 1024,
             version=int(version),
+            max_in_flight=int(
+                os.environ.get("LUMENRL_WEIGHT_SYNC_RDMA_SENDER_IN_FLIGHT", "0")
+            ),
         )
         stats["writer"] = True
         stats["fp8_quantized"] = fp8_quantize

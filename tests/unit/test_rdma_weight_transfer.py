@@ -152,6 +152,148 @@ def test_receive_stream_gpu_staging_yields_copies(monkeypatch):
     torch.testing.assert_close(tensor, torch.tensor([1.0, 2.0, 3.0]))
 
 
+class _Work:
+    def __init__(self, events, label):
+        self.events = events
+        self.label = label
+
+    def wait(self):
+        self.events.append(("wait", self.label))
+
+
+def test_receive_stream_prefetch_posts_next_bucket_before_loading(monkeypatch):
+    first = _bucket("first.weight", torch.tensor([1.0, 2.0]))
+    second = _bucket("second.weight", torch.tensor([3.0]))
+    headers = iter(
+        [
+            torch.tensor([rdma._CMD_BUCKET, len(first[0]), first[1].numel(), 3]),
+            torch.tensor([rdma._CMD_BUCKET, len(second[0]), second[1].numel(), 3]),
+            torch.tensor([rdma._CMD_END, 0, 0, 3]),
+        ]
+    )
+    sources = iter(
+        [
+            torch.tensor(list(first[0]), dtype=torch.uint8),
+            first[1],
+            torch.tensor(list(second[0]), dtype=torch.uint8),
+            second[1],
+        ]
+    )
+    events = []
+
+    def header(*args, **kwargs):
+        events.append(("header",))
+        return next(headers)
+
+    def broadcast(output, src, group, async_op=False):
+        assert async_op is True
+        if output.dtype == torch.int64:
+            output.copy_(next(headers))
+            events.append(("post", "header"))
+            return _Work(events, "header")
+        output.copy_(next(sources))
+        events.append(("post",))
+        return _Work(events, "bucket")
+
+    monkeypatch.setattr(rdma, "_broadcast_header", header)
+    monkeypatch.setattr(rdma.dist, "broadcast", broadcast)
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+
+    class Model:
+        def named_parameters(self):
+            return iter(())
+
+        def named_buffers(self):
+            return iter(())
+
+        def load_weights(self, weights):
+            for name, tensor in weights:
+                events.append(("load", name, tensor.tolist()))
+            return {"first", "second"}
+
+    stats = rdma.receive_weight_stream(
+        object(),
+        Model(),
+        device=torch.device("cpu"),
+        expected_version=3,
+        verify_full_load=False,
+        staging="none",
+        prefetch=True,
+    )
+
+    assert events == [
+        ("header",), ("post",), ("post",), ("post", "header"),
+        ("wait", "bucket"), ("wait", "bucket"),
+        ("wait", "header"), ("post",), ("post",), ("post", "header"),
+        ("load", "first.weight", [1.0, 2.0]),
+        ("wait", "bucket"), ("wait", "bucket"),
+        ("wait", "header"),
+        ("load", "second.weight", [3.0]),
+    ]
+    assert stats["buckets"] == 2
+
+
+def test_send_stream_pipelined_bounds_buckets_in_flight(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("requires a GPU for pinned host-to-device metadata")
+    weights = [(f"w{i}.weight", torch.full((4,), float(i), device="cuda")) for i in range(5)]
+    posted = []  # (kind, cpu copy) in post order
+    outstanding = []  # bucket indices posted and not yet retired
+    max_outstanding = 0
+    events = []
+
+    class Work:
+        def __init__(self, bucket, last):
+            self.bucket = bucket
+            self.last = last
+
+        def wait(self):
+            events.append(("wait", self.bucket))
+            if self.last and self.bucket in outstanding:
+                outstanding.remove(self.bucket)
+
+    def broadcast(tensor, src, group, async_op=False):
+        nonlocal max_outstanding
+        assert async_op is True
+        torch.cuda.synchronize()
+        is_header = tensor.dtype == torch.int64 and tensor.numel() == 4
+        kind = "header" if is_header else ("meta" if len(posted) % 3 == 1 else "payload")
+        posted.append((kind, tensor.cpu().clone()))
+        bucket = sum(1 for k, _ in posted if k == "header") - 1
+        if kind == "header" and int(tensor[0]) == rdma._CMD_BUCKET:
+            outstanding.append(bucket)
+            max_outstanding = max(max_outstanding, len(outstanding))
+        return Work(bucket, last=kind == "payload" or int(tensor.view(-1)[0]) == rdma._CMD_END)
+
+    monkeypatch.setattr(rdma.dist, "broadcast", broadcast)
+
+    stats = rdma.send_weight_stream(
+        object(),
+        iter(weights),
+        bucket_size_bytes=16,  # one 4-float tensor per bucket
+        version=9,
+        max_in_flight=2,
+    )
+
+    assert stats["buckets"] == 5
+    assert max_outstanding <= 2
+    assert not outstanding
+    kinds = [k for k, _ in posted]
+    assert kinds == ["header", "meta", "payload"] * 5 + ["header"]
+    for i in range(5):
+        header, meta, payload = (t for _, t in posted[3 * i: 3 * i + 3])
+        assert header.tolist() == [rdma._CMD_BUCKET, meta.numel(), payload.numel(), 9]
+        (entry,) = json.loads(bytes(meta.tolist()).decode("utf-8"))
+        assert entry["name"] == f"w{i}.weight"
+        torch.testing.assert_close(payload.view(torch.float32), torch.full((4,), float(i)))
+    assert posted[-1][1].tolist() == [rdma._CMD_END, 0, 0, 9]
+
+
+def test_send_stream_rejects_negative_in_flight():
+    with pytest.raises(ValueError, match="max_in_flight"):
+        rdma.send_weight_stream(object(), iter(()), bucket_size_bytes=1, version=1, max_in_flight=-1)
+
+
 def test_receive_stream_rejects_unknown_staging_mode():
     with pytest.raises(ValueError, match="invalid RDMA staging mode"):
         rdma.receive_weight_stream(
