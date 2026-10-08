@@ -16,6 +16,8 @@ encoded as runs: ``length`` parameter elements from ``param_offset`` holding
 its new byte and re-segments. A slice copy is one run per contiguous stretch, so
 memory follows the number of runs, not elements. A parameter whose runs explode
 (a fine-grained permutation) keeps its partial ids raw, bounded by its own size.
+Look-alike parameters (layers, experts) are checked against one decoded member
+instead of decoded each (see the templates section).
 """
 
 from __future__ import annotations
@@ -453,6 +455,212 @@ def _as_bytes(t: torch.Tensor, ones: bool) -> Optional[torch.Tensor]:
     return u
 
 
+# ---------------------------------------------------------------- templates
+#
+# Parameters that go through the same code (the layers of a dense model, the experts
+# of a MoE) have the same run geometry and differ only in where their ids start.
+# The first parameter of each group (same shape, dtype and name with digits
+# removed) is decoded; the others only record each pass compactly. After the last
+# pass each is predicted from a decoded member, with run offsets read from its own
+# bytes at the run starts, and the prediction is checked against every pass. A
+# mismatch replays the recorded passes through the decoder, so a wrong prediction
+# costs time, never correctness.
+
+@dataclass
+class _Packed:
+    """One pass's bytes for one parameter, run-length coded on their differences mod 256.
+
+    Packing is deterministic, so two byte arrays are equal exactly when their packed
+    forms are. Step-1 runs give a constant difference except at carries; anything
+    with more changes than that is kept raw.
+    """
+
+    n: int
+    starts: Optional[torch.Tensor] = None
+    vals: Optional[torch.Tensor] = None
+    raw: Optional[torch.Tensor] = None
+
+    def same(self, other: "_Packed") -> bool:
+        if self.n != other.n or (self.raw is None) != (other.raw is None):
+            return False
+        if self.raw is not None:
+            return torch.equal(self.raw, other.raw)
+        return torch.equal(self.starts, other.starts) and torch.equal(self.vals, other.vals)
+
+    def bytes(self) -> torch.Tensor:
+        if self.raw is not None:
+            return self.raw
+        lens = torch.diff(self.starts, append=torch.tensor([self.n]))
+        return torch.cumsum(torch.repeat_interleave(self.vals, lens), 0, dtype=torch.uint8)
+
+    def at(self, pos: torch.Tensor) -> torch.Tensor:
+        """The bytes at ``pos``, as int64."""
+        if self.raw is not None:
+            return self.raw[pos].to(torch.int64)
+        lens = torch.diff(self.starts, append=torch.tensor([self.n]))
+        v = self.vals.to(torch.int64)
+        before = torch.cumsum(v * lens, 0) - v * lens
+        seg = torch.searchsorted(self.starts, pos, right=True) - 1
+        return (before[seg] + v[seg] * (pos - self.starts[seg] + 1)) & 255
+
+
+def _pack(u: torch.Tensor) -> _Packed:
+    n = u.numel()
+    d = u.clone()
+    d[1:] -= u[:-1]
+    change = torch.nonzero(d[1:] != d[:-1]).squeeze(1) + 1
+    if 9 * (change.numel() + 1) > n:
+        return _Packed(n, raw=u.contiguous().clone())
+    starts = torch.cat([torch.zeros(1, dtype=torch.int64), change])
+    return _Packed(n, starts=starts, vals=d[starts])
+
+
+def _split_at_tensors(lines: Runs, bounds: torch.Tensor) -> Runs:
+    """``lines`` cut wherever their ids cross into another checkpoint tensor.
+
+    Look-alikes keep the geometry within each checkpoint tensor, but the tensors
+    themselves can sit in a different order in the file (and so coalesce
+    differently), e.g. an expert's gate and up adjacent in one layer and apart in
+    the next.
+    """
+    co, n, st = lines.ckpt_offset, lines.length, lines.ckpt_strides[:, 0]
+    last = co + (n - 1) * st
+    lo = torch.searchsorted(bounds, torch.minimum(co, last), right=True)
+    hi = torch.searchsorted(bounds, torch.maximum(co, last), right=True)
+    cross = set(torch.nonzero(lo != hi).squeeze(1).tolist())
+    if not cross:
+        return lines
+    po_l, n_l, co_l, st_l = (lines.param_offset.tolist(), n.tolist(), co.tolist(), st.tolist())
+    out_po, out_n, out_co, out_st = [], [], [], []
+    for r in range(len(po_l)):
+        cuts = [0, n_l[r]]
+        if r in cross:
+            s = st_l[r]
+            for b in bounds[int(lo[r]):int(hi[r])].tolist():
+                cuts.append(-((co_l[r] - b) // s) if s > 0 else (co_l[r] - b) // -s + 1)
+            cuts = sorted({c for c in cuts if 0 <= c <= n_l[r]})
+        for a, b in zip(cuts[:-1], cuts[1:]):
+            out_po.append(po_l[r] + a), out_n.append(b - a)
+            out_co.append(co_l[r] + a * st_l[r]), out_st.append(st_l[r] if b - a > 1 else 0)
+    t = lambda v: torch.tensor(v, dtype=torch.int64)  # noqa: E731
+    return Runs.lines(t(out_po), t(out_n), t(out_co), t(out_st))
+
+
+def _join_lines(lines: Runs) -> Runs:
+    """Join consecutive lines that continue each other (adjacent elements, ids on one step)."""
+    po, n, co, st = (lines.param_offset.tolist(), lines.length.tolist(),
+                     lines.ckpt_offset.tolist(), lines.ckpt_strides[:, 0].tolist())
+    out = [[po[0], n[0], co[0], st[0]]] if po else []
+    for r in range(1, len(po)):
+        p = out[-1]
+        if po[r] == p[0] + p[1]:
+            s = p[3] if p[1] > 1 else co[r] - p[2]
+            if (n[r] == 1 or st[r] == s) and co[r] == p[2] + p[1] * s:
+                p[1] += n[r]
+                p[3] = s
+                continue
+        out.append([po[r], n[r], co[r], st[r]])
+    if len(out) == len(po):
+        return lines
+    t = torch.tensor(out, dtype=torch.int64).view(-1, 4)
+    return Runs.lines(t[:, 0], t[:, 1], t[:, 2], t[:, 3])
+
+
+def _template_key(name: str, shape: tuple[int, ...], dtype: str) -> tuple:
+    import re
+
+    return (shape, dtype, re.sub(r"\d+", "#", name))
+
+
+def _run_ends(runs: Runs) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each run's last parameter position and last checkpoint id."""
+    span = runs.shape - 1
+    return (runs.param_offset + (span * runs.param_strides).sum(1),
+            runs.ckpt_offset + (span * runs.ckpt_strides).sum(1))
+
+
+def _fill(runs: Runs, numel: int) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Per-element ids (0 where nothing is written) and the written mask (None: all)."""
+    full = int(runs.length.sum()) == numel
+    if len(runs) > 4096:
+        ids = runs.expand(numel)
+        written = None if full else ids >= 0
+        return ids.clamp_(min=0), written
+    ids = torch.zeros(numel, dtype=torch.int64)
+    written = None if full else torch.zeros(numel, dtype=torch.bool)
+    po, co = runs.param_offset.tolist(), runs.ckpt_offset.tolist()
+    shape, ps, cs = runs.shape.tolist(), runs.param_strides.tolist(), runs.ckpt_strides.tolist()
+    for r in range(len(po)):
+        view = ids.as_strided(shape[r], ps[r], po[r])
+        n, st = shape[r][-1], cs[r][-1]
+        if n == 1 or st == 0:
+            row = torch.full((n,), co[r], dtype=torch.int64)
+        else:
+            row = torch.arange(co[r], co[r] + n * st, st, dtype=torch.int64)
+        if len(shape[r]) == 1:
+            view.copy_(row)
+        else:
+            v = row
+            for d in reversed(range(len(shape[r]) - 1)):
+                v = v.unsqueeze(0) + (torch.arange(shape[r][d], dtype=torch.int64)
+                                      * cs[r][d]).view(-1, *([1] * v.dim()))
+            view.copy_(v)
+        if written is not None:
+            written.as_strided(shape[r], ps[r], po[r]).fill_(True)
+    return ids, written
+
+
+def _predict(template: Runs, obs: dict, numel: int, total: int) -> Optional[Runs]:
+    """``template``'s geometry with offsets read from ``obs``, if it reproduces every pass."""
+    passes = [k for k in obs if k is not None]
+
+    def ids_at(pos: torch.Tensor) -> torch.Tensor:
+        out = torch.zeros_like(pos)
+        for k in passes:
+            out |= obs[k].at(pos) << (8 * k)
+        return out
+
+    runs = Runs(template.param_offset, ids_at(template.param_offset), template.shape,
+                template.param_strides, template.ckpt_strides)
+    span = (runs.shape - 1) * runs.ckpt_strides
+    lo = runs.ckpt_offset + span.clamp(max=0).sum(1)
+    hi = runs.ckpt_offset + span.clamp(min=0).sum(1)
+    if bool((lo < 0).any()) or bool((hi >= total).any()):
+        return None
+    last_pos, last_id = _run_ends(runs)
+    if not torch.equal(ids_at(last_pos), last_id):
+        return None
+    ids, written = _fill(runs, numel)
+    ones = torch.ones(numel, dtype=torch.uint8) if written is None else written.to(torch.uint8)
+    if not _pack(ones).same(obs[None]):
+        return None
+    b = ids.view(torch.uint8)
+    for k in passes:
+        if not _pack(b[k::8]).same(obs[k]):
+            return None
+    return runs
+
+
+class _Deferred:
+    """A parameter that only records its passes until a template can be checked."""
+
+    def __init__(self, name: str, shape: tuple[int, ...], dtype: str, limit: int) -> None:
+        self.map = ParamMap(name, shape, dtype)
+        self.obs: dict[Optional[int], _Packed] = {}
+        self.limit = limit
+
+    def record(self, k: Optional[int], b: torch.Tensor) -> None:
+        if self.map.valid:
+            self.obs[k] = _pack(b)
+
+    def replay(self, passes: list[Optional[int]], bits: int) -> ParamMap:
+        dec = _ParamDecoder(self.map.name, self.map.shape, self.map.dtype, self.limit)
+        for k in passes:
+            b = self.obs.pop(k).bytes()
+            dec.ones(b) if k is None else dec.observe(k, b)
+        return dec.finish(bits)
+
+
 ReadBack = Mapping[str, Mapping[str, torch.Tensor]]
 
 
@@ -463,6 +671,7 @@ def capture(
     compare: Optional[tuple[str, str]] = None,
     limit: int = DEFAULT_RUN_LIMIT,
     log: Callable[[str], None] = print,
+    templates: bool = True,
 ) -> tuple[dict[str, SourceMap], dict[str, str]]:
     """Run every id pass through a side's loader and decode its parameters.
 
@@ -476,6 +685,8 @@ def capture(
         compare: ``(a, b)``: classify each parameter by comparing stage ``b``'s
             bytes with stage ``a``'s on every pass.
         limit: Runs per parameter above which its ids are kept raw.
+        templates: Decode one parameter per group of look-alikes and check the
+            others against it (see ``_Packed``) instead of decoding each.
 
     Returns:
         ``({stage: SourceMap}, {param: class})``, class one of ``identity``
@@ -484,7 +695,7 @@ def capture(
     """
     import time
 
-    decoders: dict[str, dict[str, _ParamDecoder]] = {s: {} for s in decode_stages}
+    decoders: dict[str, dict[str, "_ParamDecoder | _Deferred"]] = {s: {} for s in decode_stages}
     classes: dict[str, str] = {}
     passes: list[Optional[int]] = [None, *range(index.passes)]
     for k in passes:
@@ -492,14 +703,20 @@ def capture(
         readback = run_pass(k)
         for stage in decode_stages:
             decs = decoders[stage]
+            seen: set[tuple] = set()
             for name, t in readback[stage].items():
                 dec = decs.get(name)
                 if dec is None:
-                    dec = decs[name] = _ParamDecoder(
-                        name, tuple(t.shape), str(t.dtype).removeprefix("torch."), limit)
+                    shape, dtype = tuple(t.shape), str(t.dtype).removeprefix("torch.")
+                    key = _template_key(name, shape, dtype)
+                    cls = _Deferred if templates and key in seen else _ParamDecoder
+                    seen.add(key)
+                    dec = decs[name] = cls(name, shape, dtype, limit)
                 b = _as_bytes(t, ones=k is None)
                 if b is None:
                     dec.map.valid = False
+                elif isinstance(dec, _Deferred):
+                    dec.record(k, b)
                 elif k is None:
                     dec.ones(b)
                 else:
@@ -526,9 +743,42 @@ def capture(
         del readback
         log(f"pass {'ones' if k is None else k}: {time.time() - t0:.1f}s")
     bits = 8 * index.passes
+    bounds = torch.tensor([t.start for t in index.tensors], dtype=torch.int64)
     maps = {}
     for stage, decs in decoders.items():
+        t0 = time.time()
+        known: dict[tuple, list[Runs]] = {}
+        params: dict[str, ParamMap] = {}
+        n_pred, replayed = 0, []
+        for name, dec in decs.items():
+            m = dec.map
+            key = _template_key(name, m.shape, m.dtype)
+            cands = known.setdefault(key, [])
+            decoded = False
+            if isinstance(dec, _Deferred) and m.valid:
+                for i, t in enumerate(cands):
+                    runs = _predict(t, dec.obs, m.numel, index.total)
+                    if runs is not None:
+                        m.runs = merge_rectangles(_join_lines(runs))
+                        cands.insert(0, cands.pop(i))
+                        n_pred += 1
+                        break
+                else:
+                    m, decoded = dec.replay(passes, bits), True
+                    replayed.append(name)
+                dec.obs.clear()
+            elif isinstance(dec, _ParamDecoder):
+                m, decoded = dec.finish(bits), True
+            if decoded and m.valid and m.runs is not None and len(cands) < 8:
+                lines = m.runs.as_lines()
+                if lines is not None:
+                    cands.append(_split_at_tensors(lines, bounds))
+            params[name] = m
         meta = {"checkpoint": index.fingerprint(), "elements": index.total,
-                "passes": index.passes, "stage": stage}
-        maps[stage] = SourceMap({n: d.finish(bits) for n, d in decs.items()}, meta)
+                "passes": index.passes, "stage": stage,
+                "templates": {"predicted": n_pred, "replayed": len(replayed),
+                              "replayed_names": replayed[:20]}}
+        maps[stage] = SourceMap(params, meta)
+        log(f"{stage} finish: {time.time() - t0:.1f}s, {n_pred} predicted from a template, "
+            f"{len(replayed)} replayed {replayed[:4]}")
     return maps, classes

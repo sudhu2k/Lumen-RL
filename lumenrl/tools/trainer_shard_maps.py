@@ -127,6 +127,7 @@ def main() -> None:
     ap.add_argument("--etp", type=int, default=1)
     ap.add_argument("--real", action="store_true", help="save real-checkpoint params instead")
     ap.add_argument("--threads", type=int, default=16)
+    ap.add_argument("--no-templates", action="store_true")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
@@ -185,7 +186,8 @@ def main() -> None:
     else:
         index = CheckpointIndex.from_dir(args.model)
         log = (lambda s: print(f"[rank {rank}] {s}", flush=True)) if rank == 0 else (lambda s: None)
-        maps, _ = capture(index, lambda k: {"loader": load(LazyIdState(index, k))}, log=log)
+        maps, _ = capture(index, lambda k: {"loader": load(LazyIdState(index, k))}, log=log,
+                          templates=not args.no_templates)
         m = maps["loader"]
         m.meta["coords"] = coords
         m.save(os.path.join(args.out, f"trainer_rank{rank}.pt"))

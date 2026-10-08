@@ -119,8 +119,9 @@ class SimulatedTrainer:
     every rank whose map is identical (data-parallel replicas, TP-replicated norms).
     """
 
-    def __init__(self, model_dir: str, out: str, tp: int, pp: int, ep: int, world: int) -> None:
-        self.model, self.out = model_dir, out
+    def __init__(self, model_dir: str, out: str, tp: int, pp: int, ep: int, world: int,
+                 templates: bool = True) -> None:
+        self.model, self.out, self.templates = model_dir, out, templates
         self.tp, self.pp, self.ep, self.n = tp, pp, ep, world
         self.local: dict[str, str] = {}
         self._holders: dict[str, list[int]] = {}
@@ -135,7 +136,9 @@ class SimulatedTrainer:
                "--out", os.path.join(self.out, "trainer_ranks"), "--tp", str(self.tp),
                "--pp", str(self.pp), "--ep", str(self.ep),
                "--threads", str(max(1, torch.get_num_threads() // self.n))]
-        subprocess.run(cmd + (["--real"] if real else []), check=True)
+        cmd += ["--real"] if real else []
+        cmd += [] if self.templates else ["--no-templates"]
+        subprocess.run(cmd, check=True)
 
     def capture(self) -> SourceMap:
         from lumenrl.transfer.weight_source_map import ParamMap
@@ -266,6 +269,8 @@ def main() -> None:
     ap.add_argument("--max-piece-mb", type=int, default=32)
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--threads", type=int, default=64)
+    ap.add_argument("--no-templates", action="store_true",
+                    help="decode every parameter instead of checking look-alikes against one")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
     os.makedirs(args.out, exist_ok=True)
@@ -281,13 +286,14 @@ def main() -> None:
     t0 = time.time()
     if simulate:
         trainer = SimulatedTrainer(args.model, args.out, args.trainer_tp, args.trainer_pp,
-                                   args.trainer_ep, args.n_trainer)
+                                   args.trainer_ep, args.n_trainer, not args.no_templates)
         tmaps = {"loader": trainer.capture()}
     else:
         trainer = TrainerLayout(args.model, args.n_trainer, args.trainer_ep)
         tmaps, _ = capture(index, lambda k: {"loader": trainer.catalog(index.id_state(k))},
-                           log=lambda s: log("trainer " + s))
+                           log=lambda s: log("trainer " + s), templates=not args.no_templates)
     report["trainer"] = {"build_s": round(time.time() - t0, 1), "layout": trainer.key(),
+                         "templates": tmaps["loader"].meta.get("templates"),
                          **tmaps["loader"].stats()}
     tmaps["loader"].save(os.path.join(args.out, "trainer_map.pt"))
     log(f"trainer map: {report['trainer']}")
@@ -300,12 +306,13 @@ def main() -> None:
 
     t0 = time.time()
     vmaps, classes = capture(index, vllm_pass, compare=("loader", "final"),
-                             log=lambda s: log("vllm " + s))
+                             log=lambda s: log("vllm " + s), templates=not args.no_templates)
     kinds: dict[str, int] = {}
     for c in classes.values():
         kinds[c] = kinds.get(c, 0) + 1
     report["vllm"] = {"build_s": round(time.time() - t0, 1), "classes": kinds,
                       "non_identity": sorted(n for n, c in classes.items() if c != "identity"),
+                      "templates": vmaps["loader"].meta.get("templates"),
                       **vmaps["loader"].stats()}
     vmaps["loader"].save(os.path.join(args.out, "vllm_map.pt"))
     log(f"vllm map: {report['vllm']}")
