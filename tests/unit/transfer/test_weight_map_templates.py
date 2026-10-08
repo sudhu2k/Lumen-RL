@@ -1,4 +1,4 @@
-"""Template checks: look-alike parameters predicted from one decoded member (CPU only)."""
+"""Segment-once decoding of repeated layers and experts (CPU only)."""
 
 import pytest
 import torch
@@ -66,16 +66,12 @@ def _truth(index, loader):
 
 def _check(index, loader):
     quiet = lambda s: None  # noqa: E731
-    on, _ = capture(index, lambda k: {"loader": loader(index.id_state(k))}, log=quiet)
-    off, _ = capture(index, lambda k: {"loader": loader(index.id_state(k))}, log=quiet,
-                     templates=False)
+    got, _ = capture(index, lambda k: {"loader": loader(index.id_state(k))}, log=quiet)
     truth = _truth(index, loader)
     for name, t in truth.items():
-        ids = on["loader"].params[name].ids()
+        ids = got["loader"].params[name].ids()
         w = ids >= 0
         assert torch.equal(ids[w], t[w]), name
-        assert torch.equal(ids, off["loader"].params[name].ids()), name
-    return on["loader"].meta["templates"]
 
 
 def test_pack_is_exact_and_reads_back():
@@ -99,33 +95,43 @@ def test_pack_is_exact_and_reads_back():
     assert _pack(cases[0]).raw is None and _pack(cases[2]).raw is not None
 
 
+@pytest.mark.parametrize("n", [1024, 1025, 5000, 300_007])
+def test_pack_reads_back_past_the_chunk_size(n):
+    ids = 3_000_000_123 + torch.arange(n) * 3 + (torch.arange(n) // 700) * 9000
+    for k in range(5):
+        u = ((ids >> (8 * k)) & 255).to(torch.uint8)
+        assert torch.equal(_pack(u).bytes(), u)
+
+
+def test_pack_records_a_single_fill_value():
+    for n in (1, 2, 1500):
+        for c in (0, 1, 200):
+            assert _pack(torch.full((n,), c, dtype=torch.uint8)).fill == c
+    assert _pack((torch.arange(1500) & 255).to(torch.uint8)).fill is None
+    assert _pack(torch.tensor([3] * 30 + [4], dtype=torch.uint8)).fill is None
+
+
 @pytest.mark.parametrize("base", [0, 250, (1 << 33) - 1000])
-def test_stacked_experts_predicted_and_exact(base):
+def test_stacked_experts_are_exact(base):
     index = _index(base, layers=4, experts=3)
-    stats = _check(index, _moe_loader(4, 3))
-    assert stats["predicted"] >= 6
+    _check(index, _moe_loader(4, 3))
 
 
-def test_per_expert_params_predicted_across_carries():
+def test_per_expert_params_are_exact_across_carries():
     index = _index(200, layers=2, experts=24)
-    stats = _check(index, _expert_loader(2, 24))
-    assert stats["predicted"] >= 2 * 2 * 24 - 4
-    assert stats["replayed"] == 0
+    _check(index, _expert_loader(2, 24))
 
 
-def test_checkpoint_order_differing_between_layers_is_predicted():
-    # Even layers: gate and up adjacent in the file, so each expert's [gate; up] is one
-    # run. Odd layers: down sits between them, so it is two.
+def test_checkpoint_order_differing_between_layers_is_exact():
+    # Even layers: gate and up adjacent in the file. Odd layers: down sits between them.
     index = _index(1000, layers=4, experts=3,
                    order=lambda L: ("gate", "up", "down") if L % 2 == 0 else ("gate", "down", "up"))
-    stats = _check(index, _moe_loader(4, 3))
-    assert stats["replayed_names"] == ["model.layers.1.padded"]  # written differently by design
+    _check(index, _moe_loader(4, 3))
 
 
-def test_look_alike_with_different_layout_is_replayed():
+def test_look_alike_with_different_layout_is_exact():
     index = _index(1 << 16, layers=4, experts=2)
-    stats = _check(index, _moe_loader(4, 2, odd=(2,)))
-    assert stats["replayed"] >= 1
+    _check(index, _moe_loader(4, 2, odd=(2,)))
 
 
 def test_look_alike_with_different_padding_is_exact():
