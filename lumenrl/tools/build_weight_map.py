@@ -46,14 +46,16 @@ class TrainerLayout:
     """The ``megatron_native`` engine's weights at TP=1 PP=1 as a source catalog.
 
     Every distinct trainer tensor appears once. Non-expert tensors are replicated
-    on all ranks; routed experts (grouped-GEMM names) are named by their *global*
-    index and held only by the ranks of their expert-parallel group, where they
-    sit under the local name (``local_name``). The tensors are what
-    ``_shard_hf_for_moe`` / ``hf_to_megatron`` load at ETP=1.
+    on all ranks; routed experts are named by their *global* index and held only
+    by the ranks of their expert-parallel group, where they sit under the local
+    name (``local_name``). ``grouped_gemm`` picks the engine's expert layout
+    (``TEGroupedMLP``: ``experts.linear_fc1.weight{e}``; ``SequentialMLP``:
+    ``experts.local_experts.{e}.linear_fc1.weight``); the bytes are the same. The
+    tensors are what ``_shard_hf_for_moe`` / ``hf_to_megatron`` load at ETP=1.
     """
 
     def __init__(self, model_dir: str, n_ranks: int, ep: int = 1,
-                 engine_config: Optional[dict] = None) -> None:
+                 engine_config: Optional[dict] = None, grouped_gemm: bool = True) -> None:
         import lumenrl.engine.training.model_specs  # noqa: F401  (registers the specs)
         from lumenrl.engine.training.model_registry import MODEL_REGISTRY
 
@@ -66,7 +68,7 @@ class TrainerLayout:
         self.dims = self.spec.build_dims(hf_cfg)
         if n_ranks % ep or (self.moe and self.dims.num_experts % ep) or (not self.moe and ep > 1):
             raise ValueError(f"bad layout: ranks={n_ranks} ep={ep} moe={self.moe}")
-        self.n, self.ep = n_ranks, ep
+        self.n, self.ep, self.grouped_gemm = n_ranks, ep, grouped_gemm
         self.num_local = self.dims.num_experts // ep if self.moe else 0
 
     def catalog(self, hf: dict) -> dict[str, torch.Tensor]:
@@ -79,8 +81,10 @@ class TrainerLayout:
         for L in range(d.num_layers):
             for e in range(d.num_experts):
                 p = f"decoder.layers.{L}.mlp.experts."
-                m[p + f"linear_fc1.weight{e}"] = gpt.hf_expert_fc1(hf, d, L, e)
-                m[p + f"linear_fc2.weight{e}"] = gpt.hf_expert_fc2(hf, d, L, e)
+                for fc, conv in (("1", gpt.hf_expert_fc1), ("2", gpt.hf_expert_fc2)):
+                    name = (p + f"linear_fc{fc}.weight{e}" if self.grouped_gemm
+                            else p + f"local_experts.{e}.linear_fc{fc}.weight")
+                    m[name] = conv(hf, d, L, e)
         return m
 
     def holders(self, names) -> dict[str, list[int]]:
@@ -110,7 +114,7 @@ class TrainerLayout:
 
     def key(self) -> dict:
         return {"engine": "megatron_native", "spec": self.spec.name, "tp": 1, "pp": 1,
-                "ep": self.ep, "ranks": self.n, "grouped_gemm": True}
+                "ep": self.ep, "ranks": self.n, "grouped_gemm": self.grouped_gemm}
 
 
 class SimulatedTrainer:
@@ -121,9 +125,11 @@ class SimulatedTrainer:
     every rank whose map is identical (data-parallel replicas, TP-replicated norms).
     """
 
-    def __init__(self, model_dir: str, out: str, tp: int, pp: int, ep: int, world: int) -> None:
+    def __init__(self, model_dir: str, out: str, tp: int, pp: int, ep: int, world: int,
+                 grouped_gemm: bool = True) -> None:
         self.model, self.out = model_dir, out
         self.tp, self.pp, self.ep, self.n = tp, pp, ep, world
+        self.grouped_gemm = grouped_gemm
         self.local: dict[str, str] = {}
         self._holders: dict[str, list[int]] = {}
 
@@ -138,6 +144,7 @@ class SimulatedTrainer:
                "--pp", str(self.pp), "--ep", str(self.ep),
                "--threads", str(max(1, torch.get_num_threads() // self.n))]
         cmd += ["--real"] if real else []
+        cmd += [] if self.grouped_gemm else ["--no-grouped-gemm"]
         subprocess.run(cmd, check=True)
 
     def capture(self) -> SourceMap:
@@ -180,7 +187,7 @@ class SimulatedTrainer:
 
     def key(self) -> dict:
         return {"engine": "megatron_native", "simulated": True, "tp": self.tp, "pp": self.pp,
-                "ep": self.ep, "ranks": self.n, "grouped_gemm": True}
+                "ep": self.ep, "ranks": self.n, "grouped_gemm": self.grouped_gemm}
 
 
 def _map_fingerprint(p) -> str:
@@ -370,6 +377,8 @@ def main() -> None:
     ap.add_argument("--trainer-ep", type=int, default=1, help="trainer expert parallelism")
     ap.add_argument("--trainer-tp", type=int, default=1, help="trainer tensor parallelism")
     ap.add_argument("--trainer-pp", type=int, default=1, help="trainer pipeline parallelism")
+    ap.add_argument("--trainer-grouped-gemm", action=argparse.BooleanOptionalAction, default=True,
+                    help="trainer MoE experts as TEGroupedMLP (megatron_cfg.moe_grouped_gemm)")
     ap.add_argument("--simulate-trainer", action="store_true",
                     help="build the Megatron shards per rank (implied by TP or PP > 1)")
     ap.add_argument("--n-vllm", type=int, default=4,
@@ -382,6 +391,9 @@ def main() -> None:
     ap.add_argument("--vllm-ep", action="store_true", help="vLLM enable_expert_parallel")
     ap.add_argument("--round-mb", type=int, default=512)
     ap.add_argument("--max-piece-mb", type=int, default=32)
+    ap.add_argument("--interleave", action="store_true",
+                    help="mix every source's pieces into each round (needs MORI's byte-split "
+                         "scatter-gather path)")
     ap.add_argument("--verify", action="store_true")
     ap.add_argument("--threads", type=int, default=64)
     args = ap.parse_args()
@@ -399,10 +411,11 @@ def main() -> None:
     t0 = time.time()
     if simulate:
         trainer = SimulatedTrainer(args.model, args.out, args.trainer_tp, args.trainer_pp,
-                                   args.trainer_ep, args.n_trainer)
+                                   args.trainer_ep, args.n_trainer, args.trainer_grouped_gemm)
         tmaps = {"loader": trainer.capture()}
     else:
-        trainer = TrainerLayout(args.model, args.n_trainer, args.trainer_ep)
+        trainer = TrainerLayout(args.model, args.n_trainer, args.trainer_ep,
+                                grouped_gemm=args.trainer_grouped_gemm)
         tmaps, _ = capture(index, lambda k: {"loader": trainer.catalog(index.id_state(k))},
                            log=lambda s: log("trainer " + s))
     report["trainer"] = {"build_s": round(time.time() - t0, 1), "layout": trainer.key(),
@@ -454,7 +467,8 @@ def main() -> None:
         if copies.report["overlapping_src_runs"]:
             raise RuntimeError(f"{copies.report['overlapping_src_runs']} trainer runs overlap")
         plan = plan_rounds(copies, args.n_trainer, len(g["ranks"]), args.round_mb << 20,
-                           args.max_piece_mb << 20, holders=trainer.holders(copies.src_names))
+                           args.max_piece_mb << 20, holders=trainer.holders(copies.src_names),
+                           interleave=args.interleave)
         plan.meta["src_local_names"] = {n: trainer.local_name(n) for n in plan.src_names}
         plan.meta["vllm_ranks"] = g["ranks"]
         plans.append((plan, copies))
@@ -467,6 +481,8 @@ def main() -> None:
                                   "traffic": p.meta["traffic"]}
                                  for (p, c), g in zip(plans, groups)]}
     plan_key = {"n_vllm": args.n_vllm, "round_mb": args.round_mb, "max_piece_mb": args.max_piece_mb}
+    if args.interleave:
+        plan_key["interleave"] = True
     if vllm_sharded:
         plan_key["vllm_parallel"] = {k: getattr(args, k) for k in
                                      ("vllm_tp", "vllm_pp", "vllm_dp", "vllm_pcp", "vllm_dcp")}

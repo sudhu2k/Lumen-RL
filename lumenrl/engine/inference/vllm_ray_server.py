@@ -372,6 +372,17 @@ class VLLMRayServer:
         await self.engine.reset_prefix_cache()
         return stats
 
+    async def init_mori_weight_sync(self, **kwargs: Any) -> Any:
+        return await self.engine.collective_rpc("init_mori_weight_sync", kwargs=kwargs)
+
+    async def receive_weights_mori(self, version: int, verify: bool = False) -> Any:
+        stats = await self.engine.collective_rpc(
+            "receive_weights_mori",
+            kwargs={"version": int(version), "verify": bool(verify)},
+        )
+        await self.engine.reset_prefix_cache()
+        return stats
+
     async def destroy_rdma_weight_group(self, group_name: str) -> bool:
         if self.engine is not None:
             await self.engine.collective_rpc(
@@ -835,6 +846,43 @@ class VLLMReplicaManager:
             )
             for server in self.servers
         ]
+
+    def init_mori_weight_sync(
+        self,
+        actor_wg,
+        *,
+        plan_path: str,
+        window: int,
+        num_streams: int,
+        hash_before: bool,
+    ) -> tuple[list, list]:
+        """Trainer ranks register their sources, then every replica its reader.
+
+        Rollout rank ``r`` of the plan is replica ``r`` (TP=1). Returns the trainer
+        exports and each replica's reader summary.
+        """
+        import ray
+
+        if self.tensor_parallel_size != 1:
+            raise ValueError("weight_sync.backend=mori supports vLLM TP=1 only")
+        n_src, n_dst = int(actor_wg.num_workers), len(self.servers)
+        exports = actor_wg.execute_all_sync(
+            "init_mori_weight_source",
+            plan_path=plan_path, n_dst=n_dst, num_streams=int(num_streams),
+        )
+        readers = ray.get([
+            server.init_mori_weight_sync.remote(
+                plan_path=plan_path, dst_rank=r, sources=exports, n_src=n_src,
+                n_dst=n_dst, window=int(window), num_streams=int(num_streams),
+                hash_before=bool(hash_before),
+            )
+            for r, server in enumerate(self.servers)
+        ])
+        return exports, [x[0] for x in readers]
+
+    def start_receive_weights_mori(self, *, version: int, verify: bool) -> list:
+        return [server.receive_weights_mori.remote(int(version), bool(verify))
+                for server in self.servers]
 
     def destroy_rdma_weight_group(self, actor_wg=None) -> None:
         import ray

@@ -445,6 +445,55 @@ class vLLMColocateWorkerExtension:
             dist.destroy_process_group(group)
         return True
 
+    def init_mori_weight_sync(
+        self,
+        plan_path: str,
+        dst_rank: int,
+        sources: list,
+        n_src: int,
+        n_dst: int,
+        window: int = 2,
+        num_streams: int = 64,
+        hash_before: bool = False,
+    ) -> dict[str, object]:
+        """Register this worker's parameters as the local end of MORI reads.
+
+        ``hash_before`` returns the read hashes of the weights vLLM loaded itself,
+        the reference for the startup check.
+        """
+        from lumenrl.transfer.mori_weight_transfer import MoriWeightReader, load_plan
+
+        if int(self.local_rank) != 0:
+            raise RuntimeError("weight_sync.backend=mori supports vLLM TP=1 only")
+        plan = load_plan(plan_path, n_src=int(n_src), n_dst=int(n_dst))
+        model = self.model_runner.model
+        self._mori_reader = MoriWeightReader(
+            plan, int(dst_rank), dict(model.named_parameters()), list(sources),
+            window=int(window), num_streams=int(num_streams),
+        )
+        r = self._mori_reader
+        logger.warning(
+            "MORI weight reader on rollout rank %d: %d reads in %d rounds, %.2f GB, setup %.2fs",
+            dst_rank, len(r.entries), len(r.calls), r.bytes / 1e9, r.setup_s,
+        )
+        out: dict[str, object] = {"reads": len(r.entries), "rounds": len(r.calls),
+                                  "bytes": r.bytes, "setup_s": r.setup_s}
+        if hash_before:
+            out["hashes"] = r.hashes().tolist()
+        return out
+
+    def receive_weights_mori(self, version: int, verify: bool = False) -> dict[str, object]:
+        """Read every plan region from the trainers; with ``verify`` also hash them."""
+        r = getattr(self, "_mori_reader", None)
+        if r is None:
+            raise RuntimeError("MORI weight reader is not initialized")
+        stats: dict[str, object] = {"version": float(version), **r.sync()}
+        if verify:
+            t0 = time.perf_counter()
+            stats["hashes"] = r.hashes().tolist()
+            stats["hash_s"] = time.perf_counter() - t0
+        return stats
+
     def update_weights_from_ipc(
         self,
         use_shm: bool = False,

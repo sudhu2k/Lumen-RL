@@ -782,13 +782,29 @@ class RDMAWeightSyncConfig:
 
 
 @dataclass
+class MoriWeightSyncConfig:
+    """Pull over MORI-IO XGMI: rollout ranks read a cached plan's regions from the
+    trainers' parameters (``mori-weight-sync-design.md``). One node, BF16, vLLM TP=1."""
+
+    # plan.pt from ``python -m lumenrl.tools.build_weight_map`` for this model and layout.
+    plan: str = ""
+    window: int = 2  # rounds in flight per rollout rank
+    num_streams: int = 64
+    # One sync at startup, checked against the weights vLLM loaded itself (the
+    # trainer's step-0 weights are the same checkpoint). Off when resuming.
+    startup_check: bool = True
+    # Hash every read on both sides each sync and compare (~0.09 s on 8B, debug).
+    verify: bool = False
+
+
+@dataclass
 class WeightSyncConfig:
     """Policy weight transport between separated training and rollout nodes."""
 
     enabled: bool = True
     # auto preserves the legacy selection; production choices are
     # shared_folder and rdma.
-    backend: str = "auto"  # auto | shared_folder | rdma
+    backend: str = "auto"  # auto | shared_folder | rdma | mori
     shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
     bucket_size_mb: int = 1024
     timeout_s: int = 600
@@ -796,6 +812,7 @@ class WeightSyncConfig:
     fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
     fp8_quantization_location: str | None = None  # trainer | inference; None uses legacy fp8_quantize
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+    mori: MoriWeightSyncConfig = field(default_factory=MoriWeightSyncConfig)
 
     def resolve_fp8_quantize(self) -> bool:
         """Return whether weight-sync copies are quantized on the trainer."""

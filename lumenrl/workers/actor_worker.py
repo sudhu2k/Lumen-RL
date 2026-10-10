@@ -1151,6 +1151,42 @@ class LumenActorWorker(BaseWorker):
             self._rdma_weight_group = None
         return True
 
+    def init_mori_weight_source(
+        self, plan_path: str, n_dst: int, num_streams: int = 64,
+    ) -> Any:
+        """Register this rank's parameters as MORI read sources; returns the export
+        the rollout ranks need to read them."""
+        from lumenrl.transfer.mori_weight_transfer import MoriWeightSource, load_plan
+
+        module = getattr(self._engine, "module", None)
+        if module is None or not hasattr(self._engine, "_spec"):
+            raise RuntimeError(
+                "weight_sync.backend=mori needs policy.training_backend=megatron_native"
+            )
+        if getattr(self._engine, "_overlap_param_gather", False):
+            raise RuntimeError(
+                "weight_sync.backend=mori reads the parameter buffers right after the "
+                "optimizer step; overlap_param_gather leaves them stale until the next forward"
+            )
+        plan = load_plan(plan_path, n_src=self.world_size, n_dst=int(n_dst))
+        torch.cuda.synchronize()
+        self._mori_source = MoriWeightSource(
+            plan, self.rank, dict(module.named_parameters()), num_streams=int(num_streams),
+        )
+        logger.info(
+            "MORI weight source on rank %d: %d plan sources in %d registrations",
+            self.rank, len(self._mori_source.params), len(self._mori_source.memories),
+        )
+        return self._mori_source.export().to_wire()
+
+    def prepare_mori_weight_source(self, verify: bool = False) -> Any:
+        """Called before every MORI sync; with ``verify`` returns this rank's read hashes."""
+        src = getattr(self, "_mori_source", None)
+        if src is None:
+            raise RuntimeError("MORI weight source is not initialized")
+        src.prepare()
+        return src.hashes() if verify else None
+
     def export_state_dict_safetensors(
         self,
         sync_dir: str,

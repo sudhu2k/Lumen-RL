@@ -507,6 +507,10 @@ class RLTrainer:
                 timeout_s=int(self.config.weight_sync.timeout_s),
                 group_name=group_name,
             )
+        elif weight_backend == "mori":
+            if vcfg.quantization or self.config.weight_sync.resolve_fp8_quantize():
+                raise ValueError("weight_sync.backend=mori supports BF16 rollout only")
+            self._init_mori_weight_sync(mgr)
         logger.info(
             "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s, weight_sync=%s).",
             mgr.num_replicas, tp,
@@ -813,13 +817,16 @@ class RLTrainer:
         if backend == "rdma":
             self._sync_weights_rdma(mgr)
             return
+        if backend == "mori":
+            self._sync_weights_mori(mgr)
+            return
         if backend == "shared_folder":
             self._sync_weights_safetensors(mgr)
             return
         if backend != "auto":
             raise ValueError(
                 f"Unsupported weight_sync.backend={backend!r}; "
-                "expected auto, shared_folder, or rdma"
+                "expected auto, shared_folder, rdma, or mori"
             )
 
         separated = getattr(self, "_rollout_wg", None) is not None
@@ -1009,6 +1016,119 @@ class RLTrainer:
                 for k, v in self._last_weight_sync_metrics.items()
                 if k.startswith("timing/weight_sync_rdma_")
             ),
+        )
+        if sleeping:
+            rollout_engine.wake(tags=["kv_cache"])
+
+    def _init_mori_weight_sync(self, mgr) -> None:
+        """Register MORI sources on the trainers and readers on the replicas.
+
+        With ``startup_check`` (and no resume) the trainers' step-0 weights are the
+        checkpoint vLLM loaded, so every plan read must hash the same on both sides
+        before any transfer, and again after one sync. A mismatch names the read.
+        """
+        from lumenrl.transfer.mori_weight_transfer import compare_hashes
+        from lumenrl.transfer.weight_plan import Plan
+
+        cfg = self.config.weight_sync.mori
+        if not cfg.plan:
+            raise ValueError(
+                "weight_sync.backend=mori needs weight_sync.mori.plan "
+                "(build it with python -m lumenrl.tools.build_weight_map)"
+            )
+        check = bool(cfg.startup_check) and int(getattr(self, "_resume_step", 0) or 0) == 0
+        t0 = time.perf_counter()
+        _, readers = mgr.init_mori_weight_sync(
+            self._actor_wg, plan_path=str(cfg.plan), window=int(cfg.window),
+            num_streams=int(cfg.num_streams), hash_before=check,
+        )
+        self._mori_plan = Plan.load(str(cfg.plan))
+        logger.info(
+            "MORI weight sync ready in %.2fs: %d rollout ranks, %d reads and %d rounds each, "
+            "%.2f GB per rank",
+            time.perf_counter() - t0, len(readers), int(readers[0]["reads"]),
+            int(readers[0]["rounds"]), float(readers[0]["bytes"]) / 1e9,
+        )
+        if not check:
+            return
+        src = self._actor_wg.execute_all_sync("prepare_mori_weight_source", verify=True)
+        bad = [
+            f"rollout rank {d}: {b}"
+            for d, r in enumerate(readers)
+            for b in compare_hashes(self._mori_plan, d, torch.tensor(r["hashes"]), src)
+        ]
+        if bad:
+            raise RuntimeError(
+                "MORI startup check: the plan does not map the trainer's weights onto "
+                f"vLLM's own load ({len(bad)} reads differ): {bad[:5]}"
+            )
+        rows, bad, _ = self._run_mori_sync(mgr, version=0, verify=True, src=src)
+        if bad:
+            raise RuntimeError(f"MORI startup check: a sync changed vLLM's weights: {bad[:5]}")
+        logger.info(
+            "MORI startup check passed: every read matches before and after one sync "
+            "(%.3fs)", max(float(r["seconds"]) for r in rows),
+        )
+
+    def _run_mori_sync(self, mgr, *, version: int, verify: bool, src=None):
+        """One MORI sync; returns the replicas' stats, mismatching reads, and wall time."""
+        import ray
+
+        from lumenrl.transfer.mori_weight_transfer import compare_hashes
+
+        prepared = self._actor_wg.execute_all_sync("prepare_mori_weight_source", verify=verify)
+        src = src if src is not None else prepared
+        t0 = time.perf_counter()
+        results = ray.get(
+            mgr.start_receive_weights_mori(version=version, verify=verify),
+            timeout=float(self.config.weight_sync.timeout_s),
+        )
+        read_s = time.perf_counter() - t0
+        rows = [r[0] for r in results]
+        bad = []
+        if verify:
+            for d, row in enumerate(rows):
+                bad += [f"rollout rank {d}: {b}" for b in compare_hashes(
+                    self._mori_plan, d, torch.tensor(row.pop("hashes")), src)]
+        return rows, bad, read_s
+
+    def _sync_weights_mori(self, mgr) -> None:
+        """Rollout replicas pull the plan's regions from the trainers over MORI XGMI."""
+        if self._actor_wg is None:
+            return
+        rollout_engine = self._ray_vllm_engine
+        sleeping = bool(getattr(rollout_engine, "enable_sleep", False))
+        if sleeping:
+            rollout_engine.wake(tags=["weights"])
+        version = int(self.global_step) + 1
+        verify = bool(self.config.weight_sync.mori.verify)
+        started = time.perf_counter()
+        rows, bad, read_s = self._run_mori_sync(mgr, version=version, verify=verify)
+        if bad:
+            raise RuntimeError(
+                f"MORI weight sync v{version}: {len(bad)} reads differ from the trainer: {bad[:5]}"
+            )
+        total_s = time.perf_counter() - started
+        nbytes = float(rows[0]["bytes"])
+        transfer_s = max(float(r["seconds"]) for r in rows)
+        self._last_weight_sync_metrics = {
+            "timing/weight_sync_mori_s": total_s,
+            "timing/weight_sync_mori_transfer_s": transfer_s,
+            "timing/weight_sync_mori_rpc_s": read_s,
+            "weight_sync/bytes": nbytes * len(rows),
+            "weight_sync/gbps": nbytes * len(rows) / transfer_s / 1e9 if transfer_s > 0 else 0.0,
+            "weight_sync/version": float(version),
+            "weight_sync/backend_mori": 1.0,
+            "weight_sync/verified": float(verify),
+        }
+        if verify:
+            self._last_weight_sync_metrics["timing/weight_sync_mori_hash_s"] = max(
+                float(r.get("hash_s", 0.0)) for r in rows
+            )
+        logger.info(
+            "MORI weight sync committed: version=%d bytes=%.1fGB per rank x %d transfer=%.3fs "
+            "rpc=%.3fs total=%.3fs verified=%s",
+            version, nbytes / 1e9, len(rows), transfer_s, read_s, total_s, verify,
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
