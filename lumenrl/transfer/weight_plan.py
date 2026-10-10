@@ -13,6 +13,7 @@ batched MORI read takes.
 from __future__ import annotations
 
 import bisect
+import heapq
 from dataclasses import dataclass, field
 from typing import Mapping, Optional
 
@@ -263,14 +264,40 @@ class Plan:
                 "round_src_skew_mean": round(float((per_round.max(1).values / mean).mean()), 3)}
 
 
+def _interleave(items: list, keys: list, nbytes: list[int]) -> list:
+    """Merge the per-key subsequences of ``items``, each kept in order, so that every
+    prefix holds about the same fraction of each key's bytes."""
+    groups: dict = {}
+    for i, k in enumerate(keys):
+        groups.setdefault(k, []).append(i)
+    if len(groups) < 2:
+        return items
+    total = {k: sum(nbytes[i] for i in g) for k, g in groups.items()}
+    heap = [(0.0, j, k, 0, 0) for j, k in enumerate(groups)]
+    out = []
+    while heap:
+        _, j, k, pos, done = heapq.heappop(heap)
+        i = groups[k][pos]
+        out.append(items[i])
+        done += nbytes[i]
+        if pos + 1 < len(groups[k]):
+            heapq.heappush(heap, (done / total[k], j, k, pos + 1, done))
+    return out
+
+
 def plan_rounds(copies: Copies, n_src: int, n_dst: int, round_bytes: int = 512 << 20,
                 max_piece_bytes: int = 32 << 20,
-                holders: Optional[Mapping[str, list[int]]] = None) -> Plan:
+                holders: Optional[Mapping[str, list[int]]] = None,
+                interleave: bool = False) -> Plan:
     """Rounds and source assignment for ``n_dst`` identical rollout ranks.
 
     Every rollout rank needs all of ``copies`` (TP=1 replicas). Copies are cut into
     pieces of at most ``max_piece_bytes``, in destination order, then into rounds
-    of at most ``round_bytes`` per rollout rank. Within a round, pieces go to the
+    of at most ``round_bytes`` per rollout rank. With ``interleave``, pieces whose
+    tensors have different holders are first interleaved by bytes, so under EP
+    every round reads each rank's experts in proportion; this needs a transport
+    that splits copies by bytes (MORI's default XGMI path got slower with it,
+    design doc 2.8). Within a round, pieces go to the
     least-loaded source among those holding the piece's source tensor
     (``holders``, by source name; default every source), starting from a different
     source on each rollout rank, so the ``n_src x n_dst`` links carry about the
@@ -301,6 +328,10 @@ def plan_rounds(copies: Copies, n_src: int, n_dst: int, round_bytes: int = 512 <
         for r in range(R):
             for off in range(0, rb, step):
                 pieces.append((i, r, 1, off, min(step, rb - off)))
+    src_l = copies.src.tolist()
+    if interleave:
+        pieces = _interleave(pieces, [tuple(can[src_l[p[0]]]) for p in pieces],
+                             [p[2] * p[4] for p in pieces])
     rounds, cur, cur_b = [], [], 0
     for p in pieces:
         b = p[2] * p[4]
@@ -311,7 +342,7 @@ def plan_rounds(copies: Copies, n_src: int, n_dst: int, round_bytes: int = 512 <
         cur_b += b
     if cur:
         rounds.append(cur)
-    dst_l, src_l = copies.dst.tolist(), copies.src.tolist()
+    dst_l = copies.dst.tolist()
     rows = []
     for d in range(n_dst):
         # Each rollout rank starts at a different round: under EP a round's experts
@@ -329,7 +360,7 @@ def plan_rounds(copies: Copies, n_src: int, n_dst: int, round_bytes: int = 512 <
                              s_b[ci] + r0 * ss_b[ci] + off, nb, nr, dstr, sstr))
     plan = Plan(copies.dst_names, copies.src_names, torch.tensor(rows, dtype=torch.int64),
                 {"n_src": n_src, "n_dst": n_dst, "round_bytes": round_bytes,
-                 "max_piece_bytes": max_piece_bytes})
+                 "max_piece_bytes": max_piece_bytes, "interleave": interleave})
     total = copies.total_bytes()
     plan.meta["model_bytes"] = total
     plan.meta["traffic"] = plan.traffic()

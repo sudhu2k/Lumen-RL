@@ -59,7 +59,7 @@ class LazyIdState(Mapping):
         return len(self._names)
 
 
-def _build_model(hf: dict, spec, tp: int, pp: int, ep: int, etp: int):
+def _build_model(hf: dict, spec, tp: int, pp: int, ep: int, etp: int, grouped_gemm: bool = True):
     """The engine's GPTModel for this rank, on CPU (layout-relevant fields only)."""
     from megatron.core import parallel_state as mpu
     from megatron.core.models.gpt.gpt_layer_specs import (
@@ -80,7 +80,7 @@ def _build_model(hf: dict, spec, tp: int, pp: int, ep: int, etp: int):
             num_moe_experts=int(hf_num_experts(hf)),
             moe_ffn_hidden_size=spec.build_dims(hf).moe_ffn,
             moe_router_topk=int(hf.get("num_experts_per_tok") or 2),
-            moe_grouped_gemm=True,
+            moe_grouped_gemm=grouped_gemm,
             moe_router_load_balancing_type="aux_loss",
             moe_aux_loss_coeff=0.0,
             expert_model_parallel_size=ep,
@@ -125,6 +125,7 @@ def main() -> None:
     ap.add_argument("--pp", type=int, default=1)
     ap.add_argument("--ep", type=int, default=1)
     ap.add_argument("--etp", type=int, default=1)
+    ap.add_argument("--grouped-gemm", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--real", action="store_true", help="save real-checkpoint params instead")
     ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
@@ -153,7 +154,7 @@ def main() -> None:
     if spec.name not in ("gpt_dense", "gpt_moe"):
         raise NotImplementedError(spec.name)
     moe = spec.name == "gpt_moe"
-    model = _build_model(hf_cfg, spec, args.tp, args.pp, args.ep, args.etp)
+    model = _build_model(hf_cfg, spec, args.tp, args.pp, args.ep, args.etp, args.grouped_gemm)
     stub = MegatronNativeEngine.__new__(MegatronNativeEngine)
     stub._dims = spec.build_dims(hf_cfg)
 
