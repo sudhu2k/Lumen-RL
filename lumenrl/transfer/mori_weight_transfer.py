@@ -219,7 +219,8 @@ class MoriWeightReader:
     """
 
     def __init__(self, plan: Plan, dst_rank: int, params: Mapping[str, torch.Tensor],
-                 sources: list, window: int = 2, num_streams: int = 64) -> None:
+                 sources: list, window: int = 2, num_streams: int = 64,
+                 strided: bool = True) -> None:
         from mori.io import EngineDesc, MemoryDesc
 
         sources = [SourceExport.from_wire(s) for s in sources]
@@ -248,22 +249,28 @@ class MoriWeightReader:
         at = {q: t.data_ptr() - lo for q, t in self.tensors.items()}
 
         n_rounds = int(self.rows[:, _ROUND].max()) + 1
-        groups: list[dict[tuple[int, int], tuple[list, list, list]]] = [{} for _ in range(n_rounds)]
-        self.entries = read_entries(self.rows)
-        for rnd, s, dp, do, sp, so, n in self.entries:
+        groups: list[dict[tuple[int, int], tuple[list, ...]]] = [{} for _ in range(n_rounds)]
+        # strided: one read per plan row, rows and pitches included (MORI's
+        # batch_read_strided, if this MORI has it); otherwise one contiguous read per row.
+        self.strided = bool(strided) and hasattr(self.eng, "batch_read_strided")
+        if self.strided:
+            self.entries = [(r[_ROUND], r[_SRC], r[_DP], r[_DO], r[_SP], r[_SO], r[_RB], r[_NR],
+                             r[_DS], r[_SS]) for r in self.rows.tolist()]
+        else:
+            self.entries = [(*e, 1, e[6], e[6]) for e in read_entries(self.rows)]
+        for rnd, s, dp, do, sp, so, n, nr, ds, ss in self.entries:
             mem, base, _ = by_rank[s].params[sp]
-            g = groups[rnd].setdefault((s, mem), ([], [], []))
-            g[0].append(at[dp] + do)
-            g[1].append(base + so)
-            g[2].append(n)
+            g = groups[rnd].setdefault((s, mem), ([], [], [], [], [], []))
+            for col, v in zip(g, (at[dp] + do, base + so, n, nr, ds, ss)):
+                col.append(v)
         self.calls = []
         for g in groups:
             keys = list(g)
             if keys:
                 self.calls.append(([self.local] * len(keys), [g[k][0] for k in keys],
-                                   [remote[k[0]][k[1]] for k in keys], [g[k][1] for k in keys],
-                                   [g[k][2] for k in keys]))
-        self.bytes = int(sum(e[6] for e in self.entries))
+                                   [remote[k[0]][k[1]] for k in keys],
+                                   *([g[k][c] for k in keys] for c in range(1, 6))))
+        self.bytes = int(sum(e[6] * e[7] for e in self.entries))
         self.setup_s = time.perf_counter() - t0
 
     def sync(self) -> dict[str, Any]:
@@ -280,11 +287,14 @@ class MoriWeightReader:
                 elif not st.Succeeded():
                     failures.append("")
 
-        for ld, lo, rd, ro, sz in self.calls:
+        for ld, lo, rd, ro, sz, nr, lp, rp in self.calls:
             while len(pending) >= self.window:
                 drain(pending.pop(0))
-            pending.append(self.eng.batch_read(ld, lo, rd, ro, sz,
-                                               [self.eng.allocate_transfer_uid() for _ in sz]))
+            uids = [self.eng.allocate_transfer_uid() for _ in sz]
+            if self.strided:
+                pending.append(self.eng.batch_read_strided(ld, lo, rd, ro, sz, nr, lp, rp, uids))
+            else:
+                pending.append(self.eng.batch_read(ld, lo, rd, ro, sz, uids))
         for statuses in pending:
             drain(statuses)
         torch.cuda.synchronize(self.device)
