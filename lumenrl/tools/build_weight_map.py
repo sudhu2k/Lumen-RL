@@ -30,7 +30,7 @@ from typing import Optional
 
 import torch
 
-from lumenrl.transfer.weight_plan import apply_plan, correspond, plan_rounds
+from lumenrl.transfer.weight_plan import apply_plan, correspond, merge_plans, plan_rounds
 from lumenrl.transfer.weight_source_map import CheckpointIndex, SourceMap, capture
 
 _T0 = time.time()
@@ -382,7 +382,7 @@ def main() -> None:
     ap.add_argument("--simulate-trainer", action="store_true",
                     help="build the Megatron shards per rank (implied by TP or PP > 1)")
     ap.add_argument("--n-vllm", type=int, default=4,
-                    help="identical vLLM replicas, used when no vLLM parallel size is set")
+                    help="vLLM replicas, each with the parallel sizes below")
     ap.add_argument("--vllm-tp", type=int, default=1)
     ap.add_argument("--vllm-pp", type=int, default=1)
     ap.add_argument("--vllm-dp", type=int, default=1)
@@ -452,31 +452,32 @@ def main() -> None:
                           **vmaps["loader"].stats()}
         vmaps["loader"].save(os.path.join(args.out, "vllm_map.pt"))
         log(f"vllm map: {report['vllm']}")
-        groups = [{"ranks": list(range(args.n_vllm)), "map": vmaps["loader"], "classes": classes,
-                   "single_ref": True}]
+        groups = [{"ranks": [0], "map": vmaps["loader"], "classes": classes}]
         vllm_key = vm.key()
         ranks = None
+    world = ranks.world if ranks is not None else 1
 
     plans = []
     t0 = time.time()
-    for gi, g in enumerate(groups):
+    for g in groups:
         classes = g["classes"]
         identity = [n for n, c in classes.items()
                     if c == "identity" and g["map"].params[n].valid]
         copies = correspond(tmaps["loader"], g["map"], sorted(identity))
         if copies.report["overlapping_src_runs"]:
             raise RuntimeError(f"{copies.report['overlapping_src_runs']} trainer runs overlap")
-        plan = plan_rounds(copies, args.n_trainer, len(g["ranks"]), args.round_mb << 20,
-                           args.max_piece_mb << 20, holders=trainer.holders(copies.src_names),
-                           interleave=args.interleave)
+        plan = plan_rounds(copies, args.n_trainer, len(g["ranks"]) * args.n_vllm,
+                           args.round_mb << 20, args.max_piece_mb << 20,
+                           holders=trainer.holders(copies.src_names), interleave=args.interleave)
         plan.meta["src_local_names"] = {n: trainer.local_name(n) for n in plan.src_names}
-        plan.meta["vllm_ranks"] = g["ranks"]
         plans.append((plan, copies))
-        name = "plan.pt" if len(groups) == 1 else f"plan_group{gi}.pt"
         tr = plan.meta["traffic"]
-        log(f"plan {name}: ranks {g['ranks']}, {copies.report['copies']} copies "
-            f"({copies.report['line_copies']} as lines), {tr['transport_reads']} transport reads")
-    report["plan"] = {"build_s": round(time.time() - t0, 1),
+        log(f"plan: instance ranks {g['ranks']} x {args.n_vllm} replicas, "
+            f"{copies.report['copies']} copies ({copies.report['line_copies']} as lines), "
+            f"{tr['transport_reads']} transport reads")
+    plan = merge_plans([(p, g["ranks"]) for (p, _), g in zip(plans, groups)], world, args.n_vllm)
+    report["plan"] = {"build_s": round(time.time() - t0, 1), "world": world,
+                      "replicas": args.n_vllm, "traffic": plan.meta["traffic"],
                       "groups": [{"ranks": g["ranks"], "correspond": c.report,
                                   "traffic": p.meta["traffic"]}
                                  for (p, c), g in zip(plans, groups)]}
@@ -489,10 +490,10 @@ def main() -> None:
         plan_key["vllm_ep"] = args.vllm_ep
     key = cache_key(index, trainer.key(), vllm_key, plan_key)
     report["key"] = key
-    for gi, (plan, _) in enumerate(plans):
-        plan.meta["key"] = key
-        plan.save(os.path.join(args.out, "plan.pt" if len(plans) == 1 else f"plan_group{gi}.pt"))
-    log(f"key {key}")
+    plan.meta["key"] = key
+    plan.save(os.path.join(args.out, "plan.pt"))
+    log(f"plan.pt: {plan.meta['n_dst']} rollout ranks ({args.n_vllm} x {world}), "
+        f"{plan.meta['traffic']['transport_reads']} transport reads; key {key}")
 
     if args.verify:
         del tmaps
@@ -511,23 +512,25 @@ def main() -> None:
         else:
             _, single = vm.load(vm.real_weights(), keep_loader_stage=False)
         res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": [], "not_planned": []}
-        for (plan, _), g in zip(plans, groups):
-            for d, r in enumerate(g["ranks"]):
-                ref = single if ranks is None else ranks.real_params(r)
-                got = {n: torch.zeros_like(ref[n]) for n in plan.dst_names}
-                written = apply_plan(plan, d, src, got)
-                for n in plan.dst_names:
-                    res["params"] += 1
-                    if torch.equal(got[n], ref[n]):
-                        res["equal"] += 1
-                    else:
-                        res["mismatch"].append((r, n))
-                    if written.get(n, 0) != ref[n].numel() * ref[n].element_size():
-                        res["coverage_short"].append((r, n, written.get(n, 0)))
-                res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(plan.dst_names)))
-                del got
-                if ranks is not None:
-                    del ref
+        dst_col = plan.col("dst_rank")
+        for d in range(int(plan.meta["n_dst"])):
+            r = d % world
+            ref = single if ranks is None else ranks.real_params(r)
+            mine = [plan.dst_names[q] for q in sorted(set(plan.col("dst_param")[dst_col == d].tolist()))]
+            got = {n: torch.zeros_like(ref[n]) for n in mine}
+            written = apply_plan(plan, d, src, got)
+            for n in mine:
+                res["params"] += 1
+                if torch.equal(got[n], ref[n]):
+                    res["equal"] += 1
+                else:
+                    res["mismatch"].append((d, n))
+                if written.get(n, 0) != ref[n].numel() * ref[n].element_size():
+                    res["coverage_short"].append((d, n, written.get(n, 0)))
+            res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(mine)))
+            del got
+            if ranks is not None:
+                del ref
         res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
         res["verify_s"] = round(time.time() - t0, 1)
         report["verify"] = res

@@ -474,6 +474,8 @@ class RLTrainer:
             engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
         if vcfg.quantization:
             engine_kwargs["quantization"] = str(vcfg.quantization)
+        if bool(getattr(vcfg, "enable_expert_parallel", False)):
+            engine_kwargs["enable_expert_parallel"] = True
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
@@ -1040,14 +1042,16 @@ class RLTrainer:
         t0 = time.perf_counter()
         _, readers = mgr.init_mori_weight_sync(
             self._actor_wg, plan_path=str(cfg.plan), window=int(cfg.window),
-            num_streams=int(cfg.num_streams), hash_before=check,
+            num_streams=int(cfg.num_streams), strided=bool(cfg.strided), hash_before=check,
         )
         self._mori_plan = Plan.load(str(cfg.plan))
         logger.info(
-            "MORI weight sync ready in %.2fs: %d rollout ranks, %d reads and %d rounds each, "
-            "%.2f GB per rank",
-            time.perf_counter() - t0, len(readers), int(readers[0]["reads"]),
-            int(readers[0]["rounds"]), float(readers[0]["bytes"]) / 1e9,
+            "MORI weight sync ready in %.2fs: %d rollout ranks, up to %d reads in %d rounds "
+            "and %.2f GB per rank, strided reads %s",
+            time.perf_counter() - t0, len(readers), max(int(r["reads"]) for r in readers),
+            max(int(r["rounds"]) for r in readers),
+            max(float(r["bytes"]) for r in readers) / 1e9,
+            "on" if all(r.get("strided") for r in readers) else "off",
         )
         if not check:
             return
@@ -1084,7 +1088,7 @@ class RLTrainer:
             timeout=float(self.config.weight_sync.timeout_s),
         )
         read_s = time.perf_counter() - t0
-        rows = [r[0] for r in results]
+        rows = mgr.mori_rows(results)
         bad = []
         if verify:
             for d, row in enumerate(rows):
@@ -1109,14 +1113,14 @@ class RLTrainer:
                 f"MORI weight sync v{version}: {len(bad)} reads differ from the trainer: {bad[:5]}"
             )
         total_s = time.perf_counter() - started
-        nbytes = float(rows[0]["bytes"])
+        nbytes = sum(float(r["bytes"]) for r in rows)
         transfer_s = max(float(r["seconds"]) for r in rows)
         self._last_weight_sync_metrics = {
             "timing/weight_sync_mori_s": total_s,
             "timing/weight_sync_mori_transfer_s": transfer_s,
             "timing/weight_sync_mori_rpc_s": read_s,
-            "weight_sync/bytes": nbytes * len(rows),
-            "weight_sync/gbps": nbytes * len(rows) / transfer_s / 1e9 if transfer_s > 0 else 0.0,
+            "weight_sync/bytes": nbytes,
+            "weight_sync/gbps": nbytes / transfer_s / 1e9 if transfer_s > 0 else 0.0,
             "weight_sync/version": float(version),
             "weight_sync/backend_mori": 1.0,
             "weight_sync/verified": float(verify),
@@ -1126,8 +1130,8 @@ class RLTrainer:
                 float(r.get("hash_s", 0.0)) for r in rows
             )
         logger.info(
-            "MORI weight sync committed: version=%d bytes=%.1fGB per rank x %d transfer=%.3fs "
-            "rpc=%.3fs total=%.3fs verified=%s",
+            "MORI weight sync committed: version=%d bytes=%.1fGB over %d rollout ranks "
+            "transfer=%.3fs rpc=%.3fs total=%.3fs verified=%s",
             version, nbytes / 1e9, len(rows), transfer_s, read_s, total_s, verify,
         )
         if sleeping:

@@ -68,6 +68,16 @@ _VLLM_RUNTIME_ENV_KEYS = (
 )
 
 
+def _by_rollout_rank(per_replica: list) -> list[dict]:
+    """Every vLLM worker's MORI result (``collective_rpc`` gives one list per
+    replica), ordered by plan rollout rank."""
+    rows = sorted((x for r in per_replica for x in r), key=lambda x: int(x["dst_rank"]))
+    ranks = [int(x["dst_rank"]) for x in rows]
+    if ranks != list(range(len(rows))):
+        raise RuntimeError(f"MORI readers reported rollout ranks {ranks}")
+    return rows
+
+
 def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     for key in _VLLM_RUNTIME_ENV_KEYS:
         if key in os.environ:
@@ -855,34 +865,40 @@ class VLLMReplicaManager:
         window: int,
         num_streams: int,
         hash_before: bool,
+        strided: bool = True,
     ) -> tuple[list, list]:
-        """Trainer ranks register their sources, then every replica its reader.
+        """Trainer ranks register their sources, then every vLLM worker its reader.
 
-        Rollout rank ``r`` of the plan is replica ``r`` (TP=1). Returns the trainer
-        exports and each replica's reader summary.
+        Each worker of replica ``r`` is plan rollout rank ``r * tp + its rank``.
+        Returns the trainer exports and every worker's reader summary, in rollout
+        rank order.
         """
         import ray
 
-        if self.tensor_parallel_size != 1:
-            raise ValueError("weight_sync.backend=mori supports vLLM TP=1 only")
-        n_src, n_dst = int(actor_wg.num_workers), len(self.servers)
+        n_src = int(actor_wg.num_workers)
+        n_dst = len(self.servers) * int(self.tensor_parallel_size)
         exports = actor_wg.execute_all_sync(
             "init_mori_weight_source",
             plan_path=plan_path, n_dst=n_dst, num_streams=int(num_streams),
         )
         readers = ray.get([
             server.init_mori_weight_sync.remote(
-                plan_path=plan_path, dst_rank=r, sources=exports, n_src=n_src,
+                plan_path=plan_path, replica=r, sources=exports, n_src=n_src,
                 n_dst=n_dst, window=int(window), num_streams=int(num_streams),
-                hash_before=bool(hash_before),
+                strided=bool(strided), hash_before=bool(hash_before),
             )
             for r, server in enumerate(self.servers)
         ])
-        return exports, [x[0] for x in readers]
+        return exports, _by_rollout_rank(readers)
 
     def start_receive_weights_mori(self, *, version: int, verify: bool) -> list:
+        """One ref per replica; ``mori_rows`` turns their results into per-rank stats."""
         return [server.receive_weights_mori.remote(int(version), bool(verify))
                 for server in self.servers]
+
+    @staticmethod
+    def mori_rows(results: list) -> list[dict]:
+        return _by_rollout_rank(results)
 
     def destroy_rdma_weight_group(self, actor_wg=None) -> None:
         import ray

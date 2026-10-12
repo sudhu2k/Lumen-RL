@@ -259,6 +259,9 @@ class VLLMConfig:
     can use vLLM for inference + Lumen FSDP for training without verl.
     """
     tensor_parallel_size: int = 1
+    # vLLM `enable_expert_parallel`: whole experts split across the TP ranks
+    # instead of every expert tensor-sharded.
+    enable_expert_parallel: bool = False
     kv_cache_dtype: str = "auto"
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.6
@@ -784,12 +787,15 @@ class RDMAWeightSyncConfig:
 @dataclass
 class MoriWeightSyncConfig:
     """Pull over MORI-IO XGMI: rollout ranks read a cached plan's regions from the
-    trainers' parameters (``mori-weight-sync-design.md``). One node, BF16, vLLM TP=1."""
+    trainers' parameters (``mori-weight-sync-design.md``). One node, BF16."""
 
     # plan.pt from ``python -m lumenrl.tools.build_weight_map`` for this model and layout.
     plan: str = ""
     window: int = 2  # rounds in flight per rollout rank
     num_streams: int = 64
+    # One read per plan row, row stride included, when MORI has batch_read_strided;
+    # without it (or off) a strided row is one read per row, slow under vLLM TP>1.
+    strided: bool = True
     # One sync at startup, checked against the weights vLLM loaded itself (the
     # trainer's step-0 weights are the same checkpoint). Off when resuming.
     startup_check: bool = True

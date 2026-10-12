@@ -21,7 +21,7 @@ import torch
 
 from lumenrl.transfer.weight_source_map import SourceMap
 
-__all__ = ["Copies", "correspond", "Plan", "plan_rounds", "apply_plan"]
+__all__ = ["Copies", "correspond", "Plan", "plan_rounds", "merge_plans", "apply_plan"]
 
 _ELEM = {"bfloat16": 2, "float16": 2, "float32": 4, "uint8": 1, "float8_e4m3fn": 1}
 
@@ -365,6 +365,52 @@ def plan_rounds(copies: Copies, n_src: int, n_dst: int, round_bytes: int = 512 <
     plan.meta["model_bytes"] = total
     plan.meta["traffic"] = plan.traffic()
     plan.meta["ideal_per_src"] = total * n_dst / n_src
+    return plan
+
+
+def merge_plans(groups: list[tuple[Plan, list[int]]], world: int, replicas: int) -> Plan:
+    """One plan for ``replicas`` copies of a rollout instance of ``world`` ranks.
+
+    ``groups`` pairs each distinct rank's plan with the instance ranks that share it
+    (TP ranks differ, DP ranks repeat); that plan's rollout rank ``d`` is replica
+    ``d // len(ranks)``, instance rank ``ranks[d % len(ranks)]``. Rollout ranks in the
+    result are global: ``replica * world + instance rank``.
+    """
+    dst_names: list[str] = []
+    src_names: list[str] = []
+    dst_at: dict[str, int] = {}
+    src_at: dict[str, int] = {}
+    parts, local = [], {}
+    for plan, ranks in groups:
+        if int(plan.meta["n_dst"]) != len(ranks) * replicas:
+            raise ValueError(f"plan for {plan.meta['n_dst']} rollout ranks, expected "
+                             f"{len(ranks)} x {replicas}")
+        for names, at in ((plan.dst_names, dst_at), (plan.src_names, src_at)):
+            out = dst_names if at is dst_at else src_names
+            for n in names:
+                if n not in at:
+                    at[n] = len(out)
+                    out.append(n)
+        dmap = torch.tensor([dst_at[n] for n in plan.dst_names], dtype=torch.int64)
+        smap = torch.tensor([src_at[n] for n in plan.src_names], dtype=torch.int64)
+        rank_of = torch.tensor([(d // len(ranks)) * world + ranks[d % len(ranks)]
+                                for d in range(len(ranks) * replicas)], dtype=torch.int64)
+        rows = plan.rows.clone()
+        rows[:, Plan.COLS.index("dst_rank")] = rank_of[rows[:, Plan.COLS.index("dst_rank")]]
+        rows[:, Plan.COLS.index("dst_param")] = dmap[rows[:, Plan.COLS.index("dst_param")]]
+        rows[:, Plan.COLS.index("src_param")] = smap[rows[:, Plan.COLS.index("src_param")]]
+        parts.append(rows)
+        local.update(plan.meta.get("src_local_names") or {})
+    first = groups[0][0].meta
+    covered = sorted(set(torch.cat(parts)[:, 0].tolist()))
+    if covered != list(range(world * replicas)):
+        raise ValueError(f"rollout ranks {covered} do not cover {world} x {replicas}")
+    plan = Plan(dst_names, src_names, torch.cat(parts),
+                {k: first[k] for k in ("n_src", "round_bytes", "max_piece_bytes", "interleave")
+                 if k in first})
+    plan.meta.update(n_dst=world * replicas, vllm_world=world, vllm_replicas=replicas,
+                     src_local_names=local, traffic=plan.traffic(),
+                     model_bytes=int(plan.nbytes().sum()) // replicas)
     return plan
 
 
