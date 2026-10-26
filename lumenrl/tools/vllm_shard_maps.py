@@ -12,6 +12,7 @@ loaded parameters for verification.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import time
 
@@ -44,6 +45,8 @@ def main() -> None:
     ap.add_argument("--pcp", type=int, default=1, help="prefill context parallel")
     ap.add_argument("--dcp", type=int, default=1, help="decode context parallel, divides TP")
     ap.add_argument("--ep", action="store_true", help="enable_expert_parallel")
+    ap.add_argument("--engine-args", default="{}",
+                    help="weight-relevant vLLM engine arguments as JSON (dtype, backends...)")
     ap.add_argument("--real", action="store_true")
     ap.add_argument("--threads", type=int, default=16)
     args = ap.parse_args()
@@ -54,7 +57,8 @@ def main() -> None:
         raise SystemExit(f"world {os.environ['WORLD_SIZE']} != tp*pp*dp*pcp = {world}")
 
     vm = CpuVllm(args.model, tp=args.tp, pp=args.pp, dp=args.dp, pcp=args.pcp, dcp=args.dcp,
-                 expert_parallel=args.ep, rank=rank, world=world)
+                 expert_parallel=args.ep, rank=rank, world=world,
+                 engine_args=json.loads(args.engine_args))
     os.makedirs(args.out, exist_ok=True)
     t0 = time.time()
     coords = _coords(args, rank)
