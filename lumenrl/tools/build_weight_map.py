@@ -7,21 +7,21 @@ plans the reads. ``--verify`` then loads the real checkpoint on both sides and
 executes the plan with local copies: every rollout parameter must come out
 bitwise equal to what vLLM's own loader produces.
 
-Supported so far: dense and Qwen3-MoE models. The trainer side is the
-``megatron_native`` engine built from the run's own config (``--config`` plus
-overrides), so it takes whatever layout that engine takes; data-parallel copies are
-built once. The vLLM side takes TP, PP, DP, prefill context parallel and expert
-parallel (``--vllm-ep``); ranks whose loaded weights differ each get their own plan,
-and identical ranks share one. Decode context parallel subdivides TP. With
-``--vllm-engine-kwargs`` (what the trainer passes) the sizes, dtype, backends and
-any other argument that can change the loaded weights come from the rollout's own
-engine arguments.
+Supported so far: dense and Qwen3-MoE models. Both sides come from the run's own
+config (``--config`` plus overrides), resolved by the code the run uses: the trainer
+is the ``megatron_native`` engine under its engine config, so it takes whatever layout
+that engine takes (data-parallel copies are built once); vLLM gets the rollout's
+engine arguments (``vllm_engine_kwargs``: parallel sizes, dtype, backends...), and
+its ranks whose loaded weights differ each get their own plan. The rank counts
+default to the run's actor and rollout workers. The trainer passes the resolved
+configs as JSON instead (``--trainer-engine-config``, ``--vllm-engine-kwargs``).
 
 Run inside the release image, e.g.::
 
     python -m lumenrl.tools.build_weight_map --model /data/rl_data/models/Qwen3-8B-Base \\
-        --out /data/rl_data/weight_maps/qwen3-8b --n-trainer 4 --n-vllm 4 --verify \\
-        --config run.yaml policy.training.megatron_cfg.tensor_model_parallel_size=2
+        --out /data/rl_data/weight_maps/qwen3-8b --verify --config run.yaml \\
+        policy.training.megatron_cfg.tensor_model_parallel_size=2 \\
+        policy.generation.vllm_cfg.tensor_parallel_size=4
 """
 
 from __future__ import annotations
@@ -61,24 +61,23 @@ def engine_config_of(config: dict) -> dict:
         SimpleNamespace(config=config), "megatron_native", policy.get("training") or {}, policy)
 
 
-def trainer_engine_config(config_path: Optional[str], overrides: list[str]) -> dict:
-    """``engine_config_of`` the run's YAML plus ``overrides``; without a file, of the
-    defaults plus ``overrides``."""
-    from dataclasses import asdict
-
+def run_config(config_path: Optional[str], overrides: list[str]):
+    """The run's ``LumenRLConfig`` from its YAML plus ``overrides``; without a file, the
+    defaults with the ``megatron_native`` trainer plus ``overrides``."""
     from omegaconf import OmegaConf
 
     from lumenrl.core.config import LumenRLConfig
 
     if config_path:
         cfg = LumenRLConfig.from_yaml(config_path, overrides=overrides)
-        backend = str(cfg.policy.training_backend).lower().replace("-", "_")
-        if backend != "megatron_native":
-            raise NotImplementedError(f"trainer maps cover megatron_native, not {backend}")
     else:
+        dotlist = ["policy.training_backend=megatron_native", *overrides]
         cfg = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(LumenRLConfig),
-                                                  OmegaConf.from_dotlist(overrides)))
-    return engine_config_of(asdict(cfg))
+                                                  OmegaConf.from_dotlist(dotlist)))
+    backend = str(cfg.policy.training_backend).lower().replace("-", "_")
+    if backend != "megatron_native":
+        raise NotImplementedError(f"trainer maps cover megatron_native, not {backend}")
+    return cfg
 
 
 class SimulatedTrainer:
@@ -534,24 +533,19 @@ def main() -> None:
     where.add_argument("--out", help="write the maps and plan here")
     where.add_argument("--cache-dir", help="use <cache-dir>/<key>/plan.pt, building it if absent")
     ap.add_argument("--result", help="write {plan, key, cached} as JSON here")
-    ap.add_argument("--n-trainer", type=int, default=4, help="trainer ranks (sources)")
-    ap.add_argument("--config", help="the run's LumenRL YAML; the trainer layout is its "
-                                     "policy.training.megatron_cfg")
+    ap.add_argument("--config", help="the run's LumenRL YAML: the trainer layout is its "
+                                     "policy.training.megatron_cfg, the vLLM layout its "
+                                     "policy.generation.vllm_cfg")
+    ap.add_argument("--n-trainer", type=int,
+                    help="trainer ranks (sources); default: the run's actor workers")
+    ap.add_argument("--n-vllm", type=int,
+                    help="vLLM replicas; default: the run's rollout workers / vLLM world")
     ap.add_argument("--trainer-engine-config",
-                    help="the trainer's resolved engine config as JSON, instead of --config")
+                    help="the trainer's resolved engine config as JSON, instead of the config")
+    ap.add_argument("--vllm-engine-kwargs",
+                    help="the rollout's vLLM engine arguments as JSON, instead of the config")
     ap.add_argument("--all-trainer-ranks", action="store_true",
                     help="build data-parallel copies too, to check they match their leaders")
-    ap.add_argument("--n-vllm", type=int, default=4,
-                    help="vLLM replicas, each with the parallel sizes below")
-    ap.add_argument("--vllm-tp", type=int, default=1)
-    ap.add_argument("--vllm-pp", type=int, default=1)
-    ap.add_argument("--vllm-dp", type=int, default=1)
-    ap.add_argument("--vllm-pcp", type=int, default=1, help="vLLM prefill context parallel")
-    ap.add_argument("--vllm-dcp", type=int, default=1, help="vLLM decode context parallel")
-    ap.add_argument("--vllm-ep", action="store_true", help="vLLM enable_expert_parallel")
-    ap.add_argument("--vllm-engine-kwargs",
-                    help="the rollout's vLLM engine arguments as JSON (parallel sizes, dtype, "
-                         "backends...), instead of the --vllm-* sizes")
     ap.add_argument("--round-mb", type=int, default=512)
     ap.add_argument("--max-piece-mb", type=int, default=32)
     ap.add_argument("--interleave", action="store_true",
@@ -561,21 +555,41 @@ def main() -> None:
     ap.add_argument("--threads", type=int, default=64)
     ap.add_argument("overrides", nargs="*",
                     help="config overrides, e.g. policy.training.megatron_cfg."
-                         "expert_model_parallel_size=4")
+                         "expert_model_parallel_size=4 "
+                         "policy.generation.vllm_cfg.tensor_parallel_size=4")
     args = ap.parse_args()
     torch.set_num_threads(args.threads)
 
+    from dataclasses import asdict
+
+    from lumenrl.trainer.rl_trainer import ray_worker_counts, vllm_engine_kwargs
+
+    given = (args.trainer_engine_config, args.vllm_engine_kwargs, args.n_trainer, args.n_vllm)
+    cfg = None if all(x is not None for x in given) else run_config(args.config, args.overrides)
     if args.trainer_engine_config:
         with open(args.trainer_engine_config) as f:
             engine_config = json.load(f)
     else:
-        engine_config = trainer_engine_config(args.config, args.overrides)
-    args.vllm_engine_args = {}
+        engine_config = engine_config_of(asdict(cfg))
     if args.vllm_engine_kwargs:
         with open(args.vllm_engine_kwargs) as f:
-            parallel, args.vllm_engine_args = split_vllm_args(json.load(f))
-        for name, value in parallel.items():
-            setattr(args, "vllm_ep" if name == "expert_parallel" else f"vllm_{name}", value)
+            vllm_kwargs = json.load(f)
+    else:
+        vllm_kwargs = vllm_engine_kwargs(cfg)
+    parallel, args.vllm_engine_args = split_vllm_args(vllm_kwargs)
+    for name in ("tp", "pp", "dp", "pcp", "dcp"):
+        setattr(args, f"vllm_{name}", int(parallel.get(name, 1)))
+    args.vllm_ep = bool(parallel.get("expert_parallel", False))
+    if args.n_trainer is None or args.n_vllm is None:
+        actors, rollout = ray_worker_counts(cfg)
+        world = args.vllm_tp * args.vllm_pp * args.vllm_dp * args.vllm_pcp
+        if args.n_vllm is None and rollout % world:
+            raise SystemExit(f"{rollout} rollout workers are not a multiple of the vLLM world {world}")
+        args.n_trainer = actors if args.n_trainer is None else args.n_trainer
+        args.n_vllm = rollout // world if args.n_vllm is None else args.n_vllm
+    log(f"layout: {args.n_trainer} trainer ranks; {args.n_vllm} vLLM replicas of "
+        f"TP={args.vllm_tp} PP={args.vllm_pp} DP={args.vllm_dp} PCP={args.vllm_pcp} "
+        f"DCP={args.vllm_dcp} EP={args.vllm_ep}; vLLM engine args {args.vllm_engine_args}")
     index = CheckpointIndex.from_dir(args.model)
     plan_params = {"n_vllm": args.n_vllm, "round_mb": args.round_mb,
                    "max_piece_mb": args.max_piece_mb, "interleave": args.interleave}

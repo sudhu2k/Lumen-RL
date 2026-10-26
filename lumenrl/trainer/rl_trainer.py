@@ -85,6 +85,59 @@ def _format_chat_prompt(tokenizer: Any, messages: list[dict[str, Any]]) -> str:
     )
 
 
+def vllm_engine_kwargs(config: LumenRLConfig) -> dict[str, Any]:
+    """vLLM engine arguments for the ray_http rollout replicas."""
+    vcfg = config.policy.generation.vllm_cfg
+    r3 = getattr(getattr(config, "moe", None), "r3", None)
+    tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
+    engine_kwargs: dict[str, Any] = dict(
+        tensor_parallel_size=tp,
+        gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
+        dtype=str(vcfg.dtype),
+        enforce_eager=bool(vcfg.enforce_eager),
+        disable_custom_all_reduce=bool(vcfg.disable_custom_all_reduce),
+        enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
+        enable_prefix_caching=bool(vcfg.enable_prefix_caching),
+        max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
+        max_num_seqs=int(vcfg.max_num_seqs),
+        trust_remote_code=bool(vcfg.trust_remote_code),
+        enable_sleep_mode=bool(vcfg.enable_sleep_mode),
+        disable_log_stats=True,
+    )
+    # "" is the same sentinel as "auto": both mean "let vLLM select". Passing
+    # "" through reaches vLLM as an explicit request for a backend named "",
+    # which an unquantized MoE model rejects outright.
+    if str(vcfg.moe_backend) not in ("auto", ""):
+        engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
+    if str(vcfg.linear_backend) not in ("auto", ""):
+        engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
+    if bool(getattr(r3, "enabled", False)):
+        # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
+        # expert ids on the rollout engine. Fail-fast validation happens
+        # when assembling each response below.
+        engine_kwargs["enable_return_routed_experts"] = True
+    if vcfg.max_model_len:
+        engine_kwargs["max_model_len"] = int(vcfg.max_model_len)
+    if vcfg.kv_cache_dtype and vcfg.kv_cache_dtype != "auto":
+        engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
+    if vcfg.quantization:
+        engine_kwargs["quantization"] = str(vcfg.quantization)
+    if bool(getattr(vcfg, "enable_expert_parallel", False)):
+        engine_kwargs["enable_expert_parallel"] = True
+    if bool(getattr(r3, "rollout_replay", False)):
+        # makes the engine attach the selected expert ids to every completion
+        engine_kwargs["enable_return_routed_experts"] = True
+    return engine_kwargs
+
+
+def ray_worker_counts(config: LumenRLConfig) -> tuple[int, int]:
+    """(actor workers, workers hosting the rollout replicas) of a Ray-controller run."""
+    ray_cfg = config.controller.ray
+    default = max(1, config.cluster.num_nodes * config.cluster.gpus_per_node)
+    actors = ray_cfg.actor.num_workers if ray_cfg.actor.num_workers > 0 else default
+    return actors, ray_cfg.rollout.num_workers or actors
+
+
 class RLTrainer:
     """Coordinates rollout, reference, reward, and actor for RL training.
 
@@ -432,48 +485,6 @@ class RLTrainer:
             tp = pp = cp = 1
         return max(1, tp * pp * cp)
 
-    def _vllm_engine_kwargs(self, vcfg: Any) -> dict[str, Any]:
-        """vLLM engine arguments for the ray_http rollout replicas."""
-        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
-        engine_kwargs: dict[str, Any] = dict(
-            tensor_parallel_size=tp,
-            gpu_memory_utilization=float(vcfg.gpu_memory_utilization),
-            dtype=str(vcfg.dtype),
-            enforce_eager=bool(vcfg.enforce_eager),
-            disable_custom_all_reduce=bool(vcfg.disable_custom_all_reduce),
-            enable_chunked_prefill=bool(vcfg.enable_chunked_prefill),
-            enable_prefix_caching=bool(vcfg.enable_prefix_caching),
-            max_num_batched_tokens=int(vcfg.max_num_batched_tokens),
-            max_num_seqs=int(vcfg.max_num_seqs),
-            trust_remote_code=bool(vcfg.trust_remote_code),
-            enable_sleep_mode=bool(vcfg.enable_sleep_mode),
-            disable_log_stats=True,
-        )
-        # "" is the same sentinel as "auto": both mean "let vLLM select". Passing
-        # "" through reaches vLLM as an explicit request for a backend named "",
-        # which an unquantized MoE model rejects outright.
-        if str(vcfg.moe_backend) not in ("auto", ""):
-            engine_kwargs["moe_backend"] = str(vcfg.moe_backend)
-        if str(vcfg.linear_backend) not in ("auto", ""):
-            engine_kwargs["linear_backend"] = str(vcfg.linear_backend)
-        if bool(getattr(self.config.moe.r3, "enabled", False)):
-            # Patched vLLM/MILES captures [seq_len-1, num_layers, top_k]
-            # expert ids on the rollout engine. Fail-fast validation happens
-            # when assembling each response below.
-            engine_kwargs["enable_return_routed_experts"] = True
-        if vcfg.max_model_len:
-            engine_kwargs["max_model_len"] = int(vcfg.max_model_len)
-        if vcfg.kv_cache_dtype and vcfg.kv_cache_dtype != "auto":
-            engine_kwargs["kv_cache_dtype"] = str(vcfg.kv_cache_dtype)
-        if vcfg.quantization:
-            engine_kwargs["quantization"] = str(vcfg.quantization)
-        if bool(getattr(vcfg, "enable_expert_parallel", False)):
-            engine_kwargs["enable_expert_parallel"] = True
-        if self._r3_rollout_replay:
-            # makes the engine attach the selected expert ids to every completion
-            engine_kwargs["enable_return_routed_experts"] = True
-        return engine_kwargs
-
     def _setup_ray_vllm_rollout(self, model_name: str, vcfg: Any) -> None:
         """Build verl-style colocated vLLM rollout replicas + client (ray_http)."""
         from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
@@ -484,7 +495,7 @@ class RLTrainer:
         )
         seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
         tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
-        engine_kwargs = self._vllm_engine_kwargs(vcfg)
+        engine_kwargs = vllm_engine_kwargs(self.config)
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
@@ -1062,7 +1073,7 @@ class RLTrainer:
                 json.dump(engine_config_of(cfg_dict), f)
             vllm_path = os.path.join(tmp, "vllm_engine_kwargs.json")
             with open(vllm_path, "w") as f:
-                json.dump(self._vllm_engine_kwargs(vcfg), f)
+                json.dump(vllm_engine_kwargs(self.config), f)
             result_path = os.path.join(tmp, "result.json")
             log_path = os.path.join(tmp, "build.log")
             cmd = [sys.executable, "-m", "lumenrl.tools.build_weight_map",
@@ -1320,11 +1331,10 @@ class RLTrainer:
             kl_coeff = self.config.algorithm.ppo.kl_coeff
         actor_role = ray_cfg.actor
         ref_role = ray_cfg.ref
-        actor_workers = actor_role.num_workers if actor_role.num_workers > 0 else default_workers
+        actor_workers, rollout_workers = ray_worker_counts(self.config)
         ref_workers = ref_role.num_workers if ref_role.num_workers > 0 else default_workers
         if str(getattr(self.config.weight_sync, "backend", "auto")) == "mori":
             # Before any worker holds a GPU: the build needs one visible, briefly.
-            rollout_workers = ray_cfg.rollout.num_workers or actor_workers
             self._mori_plan_path = self._resolve_mori_plan(cfg_dict, actor_workers, rollout_workers)
         actor_pool_name = ray_cfg.topology_map.get("actor", "actor")
         ref_pool_name = ray_cfg.topology_map.get("ref", "ref")
