@@ -7,15 +7,21 @@ plans the reads. ``--verify`` then loads the real checkpoint on both sides and
 executes the plan with local copies: every rollout parameter must come out
 bitwise equal to what vLLM's own loader produces.
 
-Supported so far: dense and Qwen3-MoE models. The trainer side takes TP, PP, EP and
-DP (DP ranks are replicas). The vLLM side takes TP, PP, DP, prefill context parallel
-and expert parallel (``--vllm-ep``); ranks whose loaded weights differ each get their
-own plan, and identical ranks share one. Decode context parallel subdivides TP.
+Supported so far: dense and Qwen3-MoE models. The trainer side is the
+``megatron_native`` engine built from the run's own config (``--config`` plus
+overrides), so it takes whatever layout that engine takes; data-parallel copies are
+built once. The vLLM side takes TP, PP, DP, prefill context parallel and expert
+parallel (``--vllm-ep``); ranks whose loaded weights differ each get their own plan,
+and identical ranks share one. Decode context parallel subdivides TP. With
+``--vllm-engine-kwargs`` (what the trainer passes) the sizes, dtype, backends and
+any other argument that can change the loaded weights come from the rollout's own
+engine arguments.
 
 Run inside the release image, e.g.::
 
     python -m lumenrl.tools.build_weight_map --model /data/rl_data/models/Qwen3-8B-Base \\
-        --out /data/rl_data/weight_maps/qwen3-8b --n-trainer 4 --n-vllm 4 --verify
+        --out /data/rl_data/weight_maps/qwen3-8b --n-trainer 4 --n-vllm 4 --verify \\
+        --config run.yaml policy.training.megatron_cfg.tensor_model_parallel_size=2
 """
 
 from __future__ import annotations
@@ -42,96 +48,62 @@ def log(msg: str) -> None:
 
 # ---------------------------------------------------------------- trainer side
 
-class TrainerLayout:
-    """The ``megatron_native`` engine's weights at TP=1 PP=1 as a source catalog.
+def engine_config_of(config: dict) -> dict:
+    """The engine config the actor worker passes to ``MegatronNativeEngine`` for a run
+    (``policy.training.megatron_cfg`` resolved by ``LumenActorWorker._build_engine_config``),
+    from the run's config as a plain dict."""
+    from types import SimpleNamespace
 
-    Every distinct trainer tensor appears once. Non-expert tensors are replicated
-    on all ranks; routed experts are named by their *global* index and held only
-    by the ranks of their expert-parallel group, where they sit under the local
-    name (``local_name``). ``grouped_gemm`` picks the engine's expert layout
-    (``TEGroupedMLP``: ``experts.linear_fc1.weight{e}``; ``SequentialMLP``:
-    ``experts.local_experts.{e}.linear_fc1.weight``); the bytes are the same. The
-    tensors are what ``_shard_hf_for_moe`` / ``hf_to_megatron`` load at ETP=1.
-    """
+    from lumenrl.workers.actor_worker import LumenActorWorker
 
-    def __init__(self, model_dir: str, n_ranks: int, ep: int = 1,
-                 engine_config: Optional[dict] = None, grouped_gemm: bool = True) -> None:
-        import lumenrl.engine.training.model_specs  # noqa: F401  (registers the specs)
-        from lumenrl.engine.training.model_registry import MODEL_REGISTRY
+    policy = config.get("policy") or {}
+    return LumenActorWorker._build_engine_config(
+        SimpleNamespace(config=config), "megatron_native", policy.get("training") or {}, policy)
 
-        hf_cfg = json.load(open(os.path.join(model_dir, "config.json")))
-        self.spec = MODEL_REGISTRY.resolve(hf_cfg, engine_config or {})
-        if self.spec.name not in ("gpt_dense", "gpt_moe"):
-            raise NotImplementedError(f"trainer side supports gpt_dense and gpt_moe, "
-                                      f"not {self.spec.name}")
-        self.moe = self.spec.name == "gpt_moe"
-        self.dims = self.spec.build_dims(hf_cfg)
-        if n_ranks % ep or (self.moe and self.dims.num_experts % ep) or (not self.moe and ep > 1):
-            raise ValueError(f"bad layout: ranks={n_ranks} ep={ep} moe={self.moe}")
-        self.n, self.ep, self.grouped_gemm = n_ranks, ep, grouped_gemm
-        self.num_local = self.dims.num_experts // ep if self.moe else 0
 
-    def catalog(self, hf: dict) -> dict[str, torch.Tensor]:
-        from lumenrl.engine.training.bridges import gpt
+def trainer_engine_config(config_path: Optional[str], overrides: list[str]) -> dict:
+    """``engine_config_of`` the run's YAML plus ``overrides``; without a file, of the
+    defaults plus ``overrides``."""
+    from dataclasses import asdict
 
-        if not self.moe:
-            return gpt.hf_to_megatron(hf, self.dims, te=True)
-        d = self.dims
-        m = gpt.non_expert_hf_to_megatron(hf, d)
-        for L in range(d.num_layers):
-            for e in range(d.num_experts):
-                p = f"decoder.layers.{L}.mlp.experts."
-                for fc, conv in (("1", gpt.hf_expert_fc1), ("2", gpt.hf_expert_fc2)):
-                    name = (p + f"linear_fc{fc}.weight{e}" if self.grouped_gemm
-                            else p + f"local_experts.{e}.linear_fc{fc}.weight")
-                    m[name] = conv(hf, d, L, e)
-        return m
+    from omegaconf import OmegaConf
 
-    def holders(self, names) -> dict[str, list[int]]:
-        from lumenrl.engine.training.bridges.core import expert_local_index
+    from lumenrl.core.config import LumenRLConfig
 
-        every = list(range(self.n))
-        out = {}
-        for n in names:
-            exp = expert_local_index(n)
-            if exp is None:
-                out[n] = every
-            else:
-                g = exp[0] // self.num_local
-                out[n] = [r for r in every if r % self.ep == g]
-        return out
-
-    def local_name(self, name: str) -> str:
-        from lumenrl.engine.training.bridges.core import expert_local_index, relabel_expert_index
-
-        exp = expert_local_index(name)
-        return name if exp is None else relabel_expert_index(name, exp[0] % self.num_local)
-
-    def rank_states(self, catalog: dict[str, torch.Tensor]) -> dict[int, dict[str, torch.Tensor]]:
-        """Each rank's tensors under catalog names (only what that rank holds)."""
-        h = self.holders(catalog)
-        return {r: {n: t for n, t in catalog.items() if r in h[n]} for r in range(self.n)}
-
-    def key(self) -> dict:
-        return {"engine": "megatron_native", "spec": self.spec.name, "tp": 1, "pp": 1,
-                "ep": self.ep, "ranks": self.n, "grouped_gemm": self.grouped_gemm}
+    if config_path:
+        cfg = LumenRLConfig.from_yaml(config_path, overrides=overrides)
+        backend = str(cfg.policy.training_backend).lower().replace("-", "_")
+        if backend != "megatron_native":
+            raise NotImplementedError(f"trainer maps cover megatron_native, not {backend}")
+    else:
+        cfg = OmegaConf.to_object(OmegaConf.merge(OmegaConf.structured(LumenRLConfig),
+                                                  OmegaConf.from_dotlist(overrides)))
+    return engine_config_of(asdict(cfg))
 
 
 class SimulatedTrainer:
     """Trainer ranks simulated by ``trainer_shard_maps`` (torchrun, gloo, CPU).
 
-    Each rank's map comes from the engine's own sharding and ``load_state_dict``.
-    The catalog keeps one entry per distinct (name, map) pair across ranks, held by
-    every rank whose map is identical (data-parallel replicas, TP-replicated norms).
+    Each rank's map comes from the engine's own model construction, sharding and
+    ``load_state_dict``, under the run's engine config. Data-parallel copies are not
+    built: they take their leaders' maps (dense tensors from the data-parallel leader,
+    routed experts from the expert data-parallel leader). The catalog keeps one entry
+    per distinct (name, map) pair across ranks, held by every rank whose map is
+    identical (data-parallel replicas, TP-replicated norms).
     """
 
-    def __init__(self, model_dir: str, out: str, tp: int, pp: int, ep: int, world: int,
-                 grouped_gemm: bool = True) -> None:
-        self.model, self.out = model_dir, out
-        self.tp, self.pp, self.ep, self.n = tp, pp, ep, world
-        self.grouped_gemm = grouped_gemm
+    def __init__(self, model_dir: str, out: str, engine_config: dict, world: int,
+                 all_ranks: bool = False) -> None:
+        self.model, self.out, self.n, self.all_ranks = model_dir, out, world, all_ranks
+        self.engine_config = engine_config
+        self.ranks_dir = os.path.join(out, "trainer_ranks")
+        os.makedirs(self.ranks_dir, exist_ok=True)
+        self.config_path = os.path.join(out, "trainer_engine_config.json")
+        with open(self.config_path, "w") as f:
+            json.dump(engine_config, f, indent=1, sort_keys=True)
         self.local: dict[str, str] = {}
         self._holders: dict[str, list[int]] = {}
+        self.coords: list[dict] = []
 
     def _run(self, real: bool) -> None:
         import random
@@ -140,23 +112,37 @@ class SimulatedTrainer:
         cmd = ["torchrun", "--nproc-per-node", str(self.n),
                "--master-port", str(29700 + random.randrange(200)),
                "-m", "lumenrl.tools.trainer_shard_maps", "--model", self.model,
-               "--out", os.path.join(self.out, "trainer_ranks"), "--tp", str(self.tp),
-               "--pp", str(self.pp), "--ep", str(self.ep),
+               "--out", self.ranks_dir, "--engine-config", self.config_path,
                "--threads", str(max(1, torch.get_num_threads() // self.n))]
         cmd += ["--real"] if real else []
-        cmd += [] if self.grouped_gemm else ["--no-grouped-gemm"]
+        cmd += ["--all-ranks"] if self.all_ranks else []
         subprocess.run(cmd, check=True)
+
+    def _source_rank(self, r: int, local_name: str) -> int:
+        """The rank whose map (and real tensor) rank ``r`` shares for this parameter."""
+        from lumenrl.engine.training.bridges.core import expert_local_index
+
+        c = self.coords[r]
+        if c["built"]:
+            return r
+        return c["expert_leader"] if expert_local_index(local_name) else c["dense_leader"]
 
     def capture(self) -> SourceMap:
         from lumenrl.transfer.weight_source_map import ParamMap
 
         self._run(real=False)
+        self.coords = [json.load(open(os.path.join(self.ranks_dir, f"trainer_rank{r}.json")))
+                       for r in range(self.n)]
         params: dict[str, ParamMap] = {}
         seen: dict[tuple[str, str], str] = {}
+        held: dict[int, list[str]] = {}
         meta: dict = {}
         for r in range(self.n):
-            m = SourceMap.load(os.path.join(self.out, "trainer_ranks", f"trainer_rank{r}.pt"))
+            if not self.coords[r]["built"]:
+                continue
+            m = SourceMap.load(os.path.join(self.ranks_dir, f"trainer_rank{r}.pt"))
             meta = {k: v for k, v in m.meta.items() if k != "coords"}
+            held[r] = []
             for name, p in m.params.items():
                 key = (name, _map_fingerprint(p))
                 cname = seen.get(key)
@@ -166,6 +152,16 @@ class SimulatedTrainer:
                     self._holders[cname] = []
                     self.local[cname] = name
                 self._holders[cname].append(r)
+                held[r].append(cname)
+        for r in range(self.n):
+            if self.coords[r]["built"]:
+                continue
+            leaders = {self.coords[r]["dense_leader"], self.coords[r]["expert_leader"]}
+            for cname in {c for s in leaders for c in held[s]}:
+                if self._source_rank(r, self.local[cname]) in self._holders[cname]:
+                    self._holders[cname].append(r)
+        for hs in self._holders.values():
+            hs.sort()
         return SourceMap(params, meta)
 
     def holders(self, names) -> dict[str, list[int]]:
@@ -176,18 +172,19 @@ class SimulatedTrainer:
 
     def real_states(self) -> dict[int, dict[str, torch.Tensor]]:
         self._run(real=True)
+        files: dict[int, dict[str, torch.Tensor]] = {}
         out: dict[int, dict[str, torch.Tensor]] = {r: {} for r in range(self.n)}
-        for r in range(self.n):
-            real = torch.load(os.path.join(self.out, "trainer_ranks", f"real_rank{r}.pt"),
-                              weights_only=False)["params"]
-            for cname, hs in self._holders.items():
-                if r in hs:
-                    out[r][cname] = real[self.local[cname]]
+        for cname, hs in self._holders.items():
+            for r in hs:
+                s = self._source_rank(r, self.local[cname])
+                if s not in files:
+                    files[s] = torch.load(os.path.join(self.ranks_dir, f"real_rank{s}.pt"),
+                                          weights_only=False)["params"]
+                out[r][cname] = files[s][self.local[cname]]
         return out
 
     def key(self) -> dict:
-        return {"engine": "megatron_native", "simulated": True, "tp": self.tp, "pp": self.pp,
-                "ep": self.ep, "ranks": self.n, "grouped_gemm": self.grouped_gemm}
+        return trainer_key(self.engine_config, self.n)
 
 
 def _map_fingerprint(p) -> str:
@@ -202,25 +199,51 @@ def _map_fingerprint(p) -> str:
 
 # ---------------------------------------------------------------- vLLM side
 
+# ---------------------------------------------------------------- vLLM side
+
+# Rollout engine arguments that change serving but not the loaded weights.
+VLLM_RUNTIME_ARGS = frozenset({
+    "gpu_memory_utilization", "enforce_eager", "disable_custom_all_reduce",
+    "enable_chunked_prefill", "enable_prefix_caching", "max_num_batched_tokens",
+    "max_num_seqs", "enable_sleep_mode", "disable_log_stats", "max_model_len",
+    "enable_return_routed_experts", "seed",
+})
+VLLM_PARALLEL_ARGS = {"tensor_parallel_size": "tp", "pipeline_parallel_size": "pp",
+                      "data_parallel_size": "dp", "prefill_context_parallel_size": "pcp",
+                      "decode_context_parallel_size": "dcp",
+                      "enable_expert_parallel": "expert_parallel"}
+
+
+def split_vllm_args(engine_kwargs: dict) -> tuple[dict, dict]:
+    """A rollout's vLLM engine arguments as (parallel sizes keyed by ``CpuVllm``'s
+    names, the other arguments that can change the loaded weights)."""
+    parallel = {a: engine_kwargs[k] for k, a in VLLM_PARALLEL_ARGS.items() if k in engine_kwargs}
+    rest = {k: v for k, v in engine_kwargs.items()
+            if k not in VLLM_PARALLEL_ARGS and k not in VLLM_RUNTIME_ARGS}
+    return parallel, rest
+
+
 class CpuVllm:
     """A vLLM model built on CPU, loaded with the engine's own loader and post-processing.
 
     ``world > 1`` builds this process's shard. vLLM's world is
     ``dp x pp x prefill_cp x tp``; expert parallel is a flag that splits whole experts
     across that group instead of tensor-sharding each one. Every rank passes
-    ``local_rank=0`` because the parameters stay on CPU.
+    ``local_rank=0`` because the parameters stay on CPU. ``engine_args`` are the
+    rollout's weight-relevant engine arguments (``split_vllm_args``).
     """
 
     def __init__(self, model_dir: str, tp: int = 1, pp: int = 1, dp: int = 1, pcp: int = 1,
                  dcp: int = 1, expert_parallel: bool = False, rank: int = 0,
-                 world: int = 1) -> None:
+                 world: int = 1, engine_args: Optional[dict] = None) -> None:
         from vllm.config import set_current_vllm_config
         from vllm.distributed import init_distributed_environment, initialize_model_parallel
         from vllm.engine.arg_utils import EngineArgs
 
         self.tp, self.pp, self.dp, self.pcp, self.dcp = tp, pp, dp, pcp, dcp
         self.expert_parallel = expert_parallel
-        args = dict(model=model_dir, dtype="bfloat16", enforce_eager=True, max_model_len=2048)
+        self.engine_args = {"dtype": "bfloat16", **(engine_args or {})}
+        args = dict(model=model_dir, **self.engine_args, enforce_eager=True, max_model_len=2048)
         if world > 1:
             args.update(tensor_parallel_size=tp, pipeline_parallel_size=pp,
                         data_parallel_size=dp, prefill_context_parallel_size=pcp,
@@ -264,7 +287,7 @@ class CpuVllm:
         from vllm.utils.torch_utils import set_default_torch_dtype
 
         self.cfg.compilation_config.static_forward_context.clear()
-        with set_default_torch_dtype(torch.bfloat16), torch.device("cpu"):
+        with set_default_torch_dtype(self.cfg.model_config.dtype), torch.device("cpu"):
             model = initialize_model(vllm_config=self.cfg, model_config=self.cfg.model_config)
         model.load_weights(weights(model) if callable(weights) else weights)
         loader = ({n: p.detach().clone() for n, p in model.named_parameters()}
@@ -281,16 +304,8 @@ class CpuVllm:
         return lambda model: loader.get_all_weights(self.cfg.model_config, model)
 
     def key(self) -> dict:
-        import vllm
-
-        out = {"vllm": vllm.__version__,
-               "aiter": {k: os.environ.get(k) for k in sorted(os.environ)
-                         if k.startswith("VLLM_ROCM_USE_AITER")},
-               "dtype": "bfloat16", "tp": self.tp}
-        if (self.pp, self.dp, self.pcp, self.dcp, self.expert_parallel) != (1, 1, 1, 1, False):
-            out.update(pp=self.pp, dp=self.dp, pcp=self.pcp, dcp=self.dcp,
-                       expert_parallel=self.expert_parallel)
-        return out
+        return vllm_key(self.tp, self.pp, self.dp, self.pcp, self.dcp, self.expert_parallel,
+                        self.engine_args)
 
 
 class VllmRanks:
@@ -302,8 +317,10 @@ class VllmRanks:
     """
 
     def __init__(self, model_dir: str, out: str, tp: int, pp: int, dp: int, pcp: int,
-                 dcp: int, expert_parallel: bool, threads: int) -> None:
+                 dcp: int, expert_parallel: bool, threads: int,
+                 engine_args: Optional[dict] = None) -> None:
         self.model, self.out = model_dir, out
+        self.engine_args = {"dtype": "bfloat16", **(engine_args or {})}
         self.tp, self.pp, self.dp, self.pcp, self.dcp = tp, pp, dp, pcp, dcp
         self.expert_parallel, self.threads = expert_parallel, threads
         self.world = tp * pp * dp * pcp
@@ -318,7 +335,8 @@ class VllmRanks:
                "-m", "lumenrl.tools.vllm_shard_maps", "--model", self.model,
                "--out", os.path.join(self.out, "vllm_ranks"), "--tp", str(self.tp),
                "--pp", str(self.pp), "--dp", str(self.dp), "--pcp", str(self.pcp),
-               "--dcp", str(self.dcp), "--threads", str(max(1, self.threads // self.world))]
+               "--dcp", str(self.dcp), "--engine-args", json.dumps(self.engine_args),
+               "--threads", str(max(1, self.threads // self.world))]
         if self.expert_parallel:
             cmd.append("--ep")
         if real:
@@ -343,13 +361,8 @@ class VllmRanks:
                           weights_only=False)["params"]
 
     def key(self) -> dict:
-        import vllm
-
-        return {"vllm": vllm.__version__,
-                "aiter": {k: os.environ.get(k) for k in sorted(os.environ)
-                          if k.startswith("VLLM_ROCM_USE_AITER")},
-                "dtype": "bfloat16", "tp": self.tp, "pp": self.pp, "dp": self.dp,
-                "pcp": self.pcp, "dcp": self.dcp, "expert_parallel": self.expert_parallel}
+        return vllm_key(self.tp, self.pp, self.dp, self.pcp, self.dcp, self.expert_parallel,
+                        self.engine_args)
 
 
 def _rank_fingerprint(m: SourceMap) -> str:
@@ -363,79 +376,61 @@ def _rank_fingerprint(m: SourceMap) -> str:
 
 # ---------------------------------------------------------------- main
 
+def trainer_key(engine_config: dict, n_trainer: int) -> dict:
+    return {"engine": "megatron_native", "ranks": n_trainer, "engine_config": engine_config}
+
+
+def vllm_key(tp: int = 1, pp: int = 1, dp: int = 1, pcp: int = 1, dcp: int = 1,
+             expert_parallel: bool = False, engine_args: Optional[dict] = None) -> dict:
+    import vllm
+
+    return {"vllm": vllm.__version__,
+            "aiter": {k: os.environ.get(k) for k in sorted(os.environ)
+                      if k.startswith("VLLM_ROCM_USE_AITER")},
+            "tp": tp, "pp": pp, "dp": dp, "pcp": pcp, "dcp": dcp,
+            "expert_parallel": expert_parallel,
+            "engine_args": {"dtype": "bfloat16", **(engine_args or {})}}
+
+
 def cache_key(index: CheckpointIndex, trainer: dict, vllm: dict, plan: dict) -> str:
     blob = json.dumps({"checkpoint": index.fingerprint(), "trainer": trainer, "vllm": vllm,
                        "plan": plan}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--n-trainer", type=int, default=4, help="trainer ranks (sources)")
-    ap.add_argument("--trainer-ep", type=int, default=1, help="trainer expert parallelism")
-    ap.add_argument("--trainer-tp", type=int, default=1, help="trainer tensor parallelism")
-    ap.add_argument("--trainer-pp", type=int, default=1, help="trainer pipeline parallelism")
-    ap.add_argument("--trainer-grouped-gemm", action=argparse.BooleanOptionalAction, default=True,
-                    help="trainer MoE experts as TEGroupedMLP (megatron_cfg.moe_grouped_gemm)")
-    ap.add_argument("--simulate-trainer", action="store_true",
-                    help="build the Megatron shards per rank (implied by TP or PP > 1)")
-    ap.add_argument("--n-vllm", type=int, default=4,
-                    help="vLLM replicas, each with the parallel sizes below")
-    ap.add_argument("--vllm-tp", type=int, default=1)
-    ap.add_argument("--vllm-pp", type=int, default=1)
-    ap.add_argument("--vllm-dp", type=int, default=1)
-    ap.add_argument("--vllm-pcp", type=int, default=1, help="vLLM prefill context parallel")
-    ap.add_argument("--vllm-dcp", type=int, default=1, help="vLLM decode context parallel")
-    ap.add_argument("--vllm-ep", action="store_true", help="vLLM enable_expert_parallel")
-    ap.add_argument("--round-mb", type=int, default=512)
-    ap.add_argument("--max-piece-mb", type=int, default=32)
-    ap.add_argument("--interleave", action="store_true",
-                    help="mix every source's pieces into each round (needs MORI's byte-split "
-                         "scatter-gather path)")
-    ap.add_argument("--verify", action="store_true")
-    ap.add_argument("--threads", type=int, default=64)
-    args = ap.parse_args()
-    torch.set_num_threads(args.threads)
-    os.makedirs(args.out, exist_ok=True)
-    report: dict = {"model": args.model}
-
-    index = CheckpointIndex.from_dir(args.model)
+def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str) -> None:
+    """Maps, plan (``out/plan.pt``) and ``out/report.json``; with ``--verify`` also the
+    bitwise check against both engines' own loading."""
+    os.makedirs(out, exist_ok=True)
+    report: dict = {"model": args.model, "key": key}
     report["checkpoint"] = {"tensors": len(index.tensors), "elements": index.total,
                             "passes": index.passes}
     log(f"checkpoint: {len(index.tensors)} tensors, {index.total} elements, "
         f"{index.passes} passes")
 
-    simulate = args.simulate_trainer or args.trainer_tp > 1 or args.trainer_pp > 1
     t0 = time.time()
-    if simulate:
-        trainer = SimulatedTrainer(args.model, args.out, args.trainer_tp, args.trainer_pp,
-                                   args.trainer_ep, args.n_trainer, args.trainer_grouped_gemm)
-        tmaps = {"loader": trainer.capture()}
-    else:
-        trainer = TrainerLayout(args.model, args.n_trainer, args.trainer_ep,
-                                grouped_gemm=args.trainer_grouped_gemm)
-        tmaps, _ = capture(index, lambda k: {"loader": trainer.catalog(index.id_state(k))},
-                           log=lambda s: log("trainer " + s))
+    trainer = SimulatedTrainer(args.model, out, engine_config, args.n_trainer,
+                               args.all_trainer_ranks)
+    tmaps = {"loader": trainer.capture()}
     report["trainer"] = {"build_s": round(time.time() - t0, 1), "layout": trainer.key(),
+                         "built_ranks": [c["rank"] for c in trainer.coords if c["built"]],
                          **tmaps["loader"].stats()}
-    tmaps["loader"].save(os.path.join(args.out, "trainer_map.pt"))
+    tmaps["loader"].save(os.path.join(out, "trainer_map.pt"))
     log(f"trainer map: {report['trainer']}")
 
     vllm_sharded = (args.vllm_tp, args.vllm_pp, args.vllm_dp, args.vllm_pcp) != (1, 1, 1, 1) \
         or args.vllm_dcp > 1 or args.vllm_ep
     if vllm_sharded:
-        ranks = VllmRanks(args.model, args.out, args.vllm_tp, args.vllm_pp, args.vllm_dp,
-                          args.vllm_pcp, args.vllm_dcp, args.vllm_ep, args.threads)
+        ranks = VllmRanks(args.model, out, args.vllm_tp, args.vllm_pp, args.vllm_dp,
+                          args.vllm_pcp, args.vllm_dcp, args.vllm_ep, args.threads,
+                          args.vllm_engine_args)
         t0 = time.time()
         groups = ranks.capture()
         report["vllm"] = {"build_s": round(time.time() - t0, 1), "world": ranks.world,
                           "groups": [{"ranks": g["ranks"], **g["map"].stats()} for g in groups]}
         log(f"vllm maps: {len(groups)} distinct of {ranks.world} ranks, {report['vllm']['build_s']}s")
-        vllm_key = ranks.key()
     else:
-        vm = CpuVllm(args.model)
+        vm = CpuVllm(args.model, engine_args=args.vllm_engine_args)
 
         def vllm_pass(k):
             loader, final = vm.load(index.id_tensors(k), keep_loader_stage=True)
@@ -450,10 +445,9 @@ def main() -> None:
         report["vllm"] = {"build_s": round(time.time() - t0, 1), "classes": kinds,
                           "non_identity": sorted(n for n, c in classes.items() if c != "identity"),
                           **vmaps["loader"].stats()}
-        vmaps["loader"].save(os.path.join(args.out, "vllm_map.pt"))
+        vmaps["loader"].save(os.path.join(out, "vllm_map.pt"))
         log(f"vllm map: {report['vllm']}")
         groups = [{"ranks": [0], "map": vmaps["loader"], "classes": classes}]
-        vllm_key = vm.key()
         ranks = None
     world = ranks.world if ranks is not None else 1
 
@@ -481,17 +475,8 @@ def main() -> None:
                       "groups": [{"ranks": g["ranks"], "correspond": c.report,
                                   "traffic": p.meta["traffic"]}
                                  for (p, c), g in zip(plans, groups)]}
-    plan_key = {"n_vllm": args.n_vllm, "round_mb": args.round_mb, "max_piece_mb": args.max_piece_mb}
-    if args.interleave:
-        plan_key["interleave"] = True
-    if vllm_sharded:
-        plan_key["vllm_parallel"] = {k: getattr(args, k) for k in
-                                     ("vllm_tp", "vllm_pp", "vllm_dp", "vllm_pcp", "vllm_dcp")}
-        plan_key["vllm_ep"] = args.vllm_ep
-    key = cache_key(index, trainer.key(), vllm_key, plan_key)
-    report["key"] = key
     plan.meta["key"] = key
-    plan.save(os.path.join(args.out, "plan.pt"))
+    plan.save(os.path.join(out, "plan.pt"))
     log(f"plan.pt: {plan.meta['n_dst']} rollout ranks ({args.n_vllm} x {world}), "
         f"{plan.meta['traffic']['transport_reads']} transport reads; key {key}")
 
@@ -502,11 +487,8 @@ def main() -> None:
         for g in groups:
             g.pop("map", None)
         gc.collect()
-        from lumenrl.engine.training.bridges.core import load_hf_safetensors
-
         t0 = time.time()
-        src = (trainer.real_states() if simulate else
-               trainer.rank_states(trainer.catalog(load_hf_safetensors(args.model))))
+        src = trainer.real_states()
         if ranks is not None:
             ranks._run(real=True)
         else:
@@ -537,9 +519,91 @@ def main() -> None:
         log(f"verify: {res['equal']}/{res['params']} equal, not planned {res['not_planned']}")
 
     report["total_s"] = round(time.time() - _T0, 1)
-    with open(os.path.join(args.out, "report.json"), "w") as f:
+    with open(os.path.join(out, "report.json"), "w") as f:
         json.dump(report, f, indent=1)
+    bad = report.get("verify", {})
+    if bad.get("mismatch") or bad.get("coverage_short"):
+        raise RuntimeError(f"verify failed: {bad['mismatch'][:5]} {bad['coverage_short'][:5]}")
     log("done")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--model", required=True)
+    where = ap.add_mutually_exclusive_group(required=True)
+    where.add_argument("--out", help="write the maps and plan here")
+    where.add_argument("--cache-dir", help="use <cache-dir>/<key>/plan.pt, building it if absent")
+    ap.add_argument("--result", help="write {plan, key, cached} as JSON here")
+    ap.add_argument("--n-trainer", type=int, default=4, help="trainer ranks (sources)")
+    ap.add_argument("--config", help="the run's LumenRL YAML; the trainer layout is its "
+                                     "policy.training.megatron_cfg")
+    ap.add_argument("--trainer-engine-config",
+                    help="the trainer's resolved engine config as JSON, instead of --config")
+    ap.add_argument("--all-trainer-ranks", action="store_true",
+                    help="build data-parallel copies too, to check they match their leaders")
+    ap.add_argument("--n-vllm", type=int, default=4,
+                    help="vLLM replicas, each with the parallel sizes below")
+    ap.add_argument("--vllm-tp", type=int, default=1)
+    ap.add_argument("--vllm-pp", type=int, default=1)
+    ap.add_argument("--vllm-dp", type=int, default=1)
+    ap.add_argument("--vllm-pcp", type=int, default=1, help="vLLM prefill context parallel")
+    ap.add_argument("--vllm-dcp", type=int, default=1, help="vLLM decode context parallel")
+    ap.add_argument("--vllm-ep", action="store_true", help="vLLM enable_expert_parallel")
+    ap.add_argument("--vllm-engine-kwargs",
+                    help="the rollout's vLLM engine arguments as JSON (parallel sizes, dtype, "
+                         "backends...), instead of the --vllm-* sizes")
+    ap.add_argument("--round-mb", type=int, default=512)
+    ap.add_argument("--max-piece-mb", type=int, default=32)
+    ap.add_argument("--interleave", action="store_true",
+                    help="mix every source's pieces into each round (needs MORI's byte-split "
+                         "scatter-gather path)")
+    ap.add_argument("--verify", action="store_true")
+    ap.add_argument("--threads", type=int, default=64)
+    ap.add_argument("overrides", nargs="*",
+                    help="config overrides, e.g. policy.training.megatron_cfg."
+                         "expert_model_parallel_size=4")
+    args = ap.parse_args()
+    torch.set_num_threads(args.threads)
+
+    if args.trainer_engine_config:
+        with open(args.trainer_engine_config) as f:
+            engine_config = json.load(f)
+    else:
+        engine_config = trainer_engine_config(args.config, args.overrides)
+    args.vllm_engine_args = {}
+    if args.vllm_engine_kwargs:
+        with open(args.vllm_engine_kwargs) as f:
+            parallel, args.vllm_engine_args = split_vllm_args(json.load(f))
+        for name, value in parallel.items():
+            setattr(args, "vllm_ep" if name == "expert_parallel" else f"vllm_{name}", value)
+    index = CheckpointIndex.from_dir(args.model)
+    plan_params = {"n_vllm": args.n_vllm, "round_mb": args.round_mb,
+                   "max_piece_mb": args.max_piece_mb, "interleave": args.interleave}
+    key = cache_key(index, trainer_key(engine_config, args.n_trainer),
+                    vllm_key(args.vllm_tp, args.vllm_pp, args.vllm_dp, args.vllm_pcp,
+                             args.vllm_dcp, args.vllm_ep, args.vllm_engine_args), plan_params)
+
+    cached = False
+    if args.out:
+        out = args.out
+        build(args, engine_config, index, key, out)
+    else:
+        out = os.path.join(args.cache_dir, key)
+        cached = os.path.exists(os.path.join(out, "plan.pt"))
+        if cached:
+            log(f"cached plan {out}/plan.pt")
+        else:
+            tmp = f"{out}.tmp{os.getpid()}"
+            build(args, engine_config, index, key, tmp)
+            try:
+                os.rename(tmp, out)
+            except OSError:
+                if not os.path.exists(os.path.join(out, "plan.pt")):
+                    raise
+                log(f"another build finished {out} first")
+    if args.result:
+        with open(args.result, "w") as f:
+            json.dump({"plan": os.path.join(out, "plan.pt"), "key": key, "cached": cached}, f)
 
 
 if __name__ == "__main__":

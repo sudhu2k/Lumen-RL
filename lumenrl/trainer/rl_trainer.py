@@ -432,15 +432,8 @@ class RLTrainer:
             tp = pp = cp = 1
         return max(1, tp * pp * cp)
 
-    def _setup_ray_vllm_rollout(self, model_name: str, vcfg: Any) -> None:
-        """Build verl-style colocated vLLM rollout replicas + client (ray_http)."""
-        from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
-        from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
-
-        self.config.weight_sync.validate_fp8_quantization_location(
-            getattr(vcfg, "quantization", None),
-        )
-        seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+    def _vllm_engine_kwargs(self, vcfg: Any) -> dict[str, Any]:
+        """vLLM engine arguments for the ray_http rollout replicas."""
         tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
         engine_kwargs: dict[str, Any] = dict(
             tensor_parallel_size=tp,
@@ -479,6 +472,19 @@ class RLTrainer:
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
+        return engine_kwargs
+
+    def _setup_ray_vllm_rollout(self, model_name: str, vcfg: Any) -> None:
+        """Build verl-style colocated vLLM rollout replicas + client (ray_http)."""
+        from lumenrl.engine.inference.vllm_http_engine import VLLMHttpEngine
+        from lumenrl.engine.inference.vllm_ray_server import VLLMReplicaManager
+
+        self.config.weight_sync.validate_fp8_quantization_location(
+            getattr(vcfg, "quantization", None),
+        )
+        seed = self.config.seed if getattr(vcfg, "seed", None) is None else vcfg.seed
+        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
+        engine_kwargs = self._vllm_engine_kwargs(vcfg)
 
         colocation_wg = getattr(self, "_rollout_wg", None) or self._actor_wg
         if colocation_wg is not self._actor_wg:
@@ -1022,6 +1028,66 @@ class RLTrainer:
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])
 
+    def _resolve_mori_plan(self, cfg_dict: dict, n_trainer: int, n_rollout_workers: int) -> str:
+        """``weight_sync.mori.plan``, or with ``auto`` the cached plan for this run's
+        trainer engine config and vLLM layout, built first if the cache has none."""
+        import json
+        import subprocess
+        import sys
+        import tempfile
+
+        cfg = self.config.weight_sync.mori
+        if cfg.plan != "auto":
+            if not cfg.plan:
+                raise ValueError("weight_sync.mori.plan is empty; use a plan.pt path or auto")
+            return str(cfg.plan)
+        backend = str(self.config.policy.training_backend).lower().replace("-", "_")
+        vcfg = self.config.policy.generation.vllm_cfg
+        transport = str(getattr(vcfg, "transport", "fifo"))
+        if backend != "megatron_native" or not self._use_vllm or transport != "ray_http":
+            raise NotImplementedError(
+                "weight_sync.mori.plan=auto builds plans for megatron_native trainers and "
+                f"ray_http vLLM rollout, not {backend} / {self._gen_backend} ({transport})")
+        from lumenrl.tools.build_weight_map import engine_config_of
+
+        tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
+        if n_rollout_workers % tp:
+            raise ValueError(f"{n_rollout_workers} rollout workers are not a multiple of "
+                             f"vLLM tensor_parallel_size={tp}")
+        cache = os.path.expanduser(str(cfg.plan_cache_dir))
+        os.makedirs(cache, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as tmp:
+            engine_path = os.path.join(tmp, "trainer_engine_config.json")
+            with open(engine_path, "w") as f:
+                json.dump(engine_config_of(cfg_dict), f)
+            vllm_path = os.path.join(tmp, "vllm_engine_kwargs.json")
+            with open(vllm_path, "w") as f:
+                json.dump(self._vllm_engine_kwargs(vcfg), f)
+            result_path = os.path.join(tmp, "result.json")
+            log_path = os.path.join(tmp, "build.log")
+            cmd = [sys.executable, "-m", "lumenrl.tools.build_weight_map",
+                   "--model", str(self.config.policy.model_name), "--cache-dir", cache,
+                   "--result", result_path, "--trainer-engine-config", engine_path,
+                   "--vllm-engine-kwargs", vllm_path, "--n-trainer", str(n_trainer),
+                   "--n-vllm", str(n_rollout_workers // tp)]
+            t0 = time.perf_counter()
+            with open(log_path, "w") as log:
+                done = subprocess.run(cmd, stdout=log, stderr=subprocess.STDOUT)
+            if done.returncode != 0:
+                kept = os.path.join(cache, f"failed_build_{time.strftime('%Y%m%d-%H%M%S')}"
+                                           f"_{os.getpid()}.log")
+                os.replace(log_path, kept)
+                with open(kept) as log:
+                    tail = log.read()[-3000:]
+                raise RuntimeError(f"MORI weight plan build failed (log {kept}):\n{tail}")
+            with open(result_path) as f:
+                result = json.load(f)
+            if not result["cached"]:
+                os.replace(log_path, os.path.join(os.path.dirname(result["plan"]), "build.log"))
+        logger.info("MORI weight plan %s (%s in %.1fs)", result["plan"],
+                    "cached" if result["cached"] else "built", time.perf_counter() - t0)
+        return str(result["plan"])
+
     def _init_mori_weight_sync(self, mgr) -> None:
         """Register MORI sources on the trainers and readers on the replicas.
 
@@ -1033,18 +1099,14 @@ class RLTrainer:
         from lumenrl.transfer.weight_plan import Plan
 
         cfg = self.config.weight_sync.mori
-        if not cfg.plan:
-            raise ValueError(
-                "weight_sync.backend=mori needs weight_sync.mori.plan "
-                "(build it with python -m lumenrl.tools.build_weight_map)"
-            )
+        plan_path = self._mori_plan_path
         check = bool(cfg.startup_check) and int(getattr(self, "_resume_step", 0) or 0) == 0
         t0 = time.perf_counter()
         _, readers = mgr.init_mori_weight_sync(
-            self._actor_wg, plan_path=str(cfg.plan), window=int(cfg.window),
+            self._actor_wg, plan_path=plan_path, window=int(cfg.window),
             num_streams=int(cfg.num_streams), strided=bool(cfg.strided), hash_before=check,
         )
-        self._mori_plan = Plan.load(str(cfg.plan))
+        self._mori_plan = Plan.load(plan_path)
         logger.info(
             "MORI weight sync ready in %.2fs: %d rollout ranks, up to %d reads in %d rounds "
             "and %.2f GB per rank, strided reads %s",
@@ -1260,6 +1322,10 @@ class RLTrainer:
         ref_role = ray_cfg.ref
         actor_workers = actor_role.num_workers if actor_role.num_workers > 0 else default_workers
         ref_workers = ref_role.num_workers if ref_role.num_workers > 0 else default_workers
+        if str(getattr(self.config.weight_sync, "backend", "auto")) == "mori":
+            # Before any worker holds a GPU: the build needs one visible, briefly.
+            rollout_workers = ray_cfg.rollout.num_workers or actor_workers
+            self._mori_plan_path = self._resolve_mori_plan(cfg_dict, actor_workers, rollout_workers)
         actor_pool_name = ray_cfg.topology_map.get("actor", "actor")
         ref_pool_name = ray_cfg.topology_map.get("ref", "ref")
 

@@ -248,15 +248,6 @@ class MegatronNativeEngine(MegatronBaseEngine):
         return self._spec.caps if self._spec is not None else ModelCaps()
 
     def initialize(self) -> None:
-        from megatron.core import parallel_state as mpu
-        from megatron.core.models.gpt.gpt_layer_specs import (
-            get_gpt_decoder_block_spec,
-            get_gpt_layer_with_transformer_engine_spec,
-        )
-        from megatron.core.models.gpt.gpt_model import GPTModel
-        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-        from megatron.core.transformer.transformer_config import TransformerConfig
-
         from lumenrl.engine.training.megatron_te_gemm_compat import (
             install as install_te_gemm_compat,
         )
@@ -264,6 +255,56 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # No-op unless megatron-core and TransformerEngine disagree about the
         # general_gemm signature, which the MoE router path would otherwise hit.
         install_te_gemm_compat()
+
+        self._init_parallel()
+        model = self._build_model()
+        tfcfg = self._tfcfg
+        tp, pp, cp, ep, etp = self._tp, self._pp, self._cp, self._ep, self._etp
+        ec = self.engine_config
+
+        if not self._caps.supports_hf_bridge:
+            # DSv4 weights come from a torch_dist checkpoint converted offline
+            # (native FP8 -> bf16 HF -> torch_dist), because the released
+            # checkpoint is block-quantized FP8. ``dist_checkpointing.load``
+            # reshards it to this rank's TP/PP/EP on the way in.
+            ckpt = str(ec.get("dist_checkpoint_path") or self.model_name)
+            dsv4.materialize_dsv4(model)
+            report = dsv4.load_dsv4_dist_checkpoint(model, ckpt)
+            self.module = model
+            logger.info(
+                "MegatronNativeEngine[%d]: DSv4 loaded %.2fB params (%d tensors) from %s "
+                "| experts=%d topk=%d hash_layers=%d compress_ratios=%s hc_mult=%d "
+                "| tp=%d pp=%d cp=%d ep=%d etp=%d deterministic=%s",
+                self._rank(), report["num_params"] / 1e9, report["num_tensors"],
+                report["path"], tfcfg.num_moe_experts, tfcfg.moe_router_topk,
+                tfcfg.dsv4_n_hash_layers, tfcfg.dsv4_compress_ratios, tfcfg.dsv4_hc_mult,
+                tp, pp, cp, ep, etp, tfcfg.deterministic_mode,
+            )
+        else:
+            # ---- load HF weights via the TE-named bridge ----
+            logger.info(
+                "MegatronNativeEngine[%d]: loading HF weights (TE spec, moe=%s experts=%d "
+                "tp=%d pp=%d cp=%d ep=%d etp=%d) from %s",
+                self._rank(), self._is_moe, self._num_experts, tp, pp, cp, ep, etp,
+                self.model_name,
+            )
+            hf_state = load_hf_safetensors(self.model_name)
+            meg_state = self._hf_state_for_rank(model, hf_state)
+            del hf_state
+            missing = model.load_state_dict(meg_state, strict=False)
+            real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
+            if real_missing:
+                raise RuntimeError(f"Native(TE) load missing keys: {real_missing[:6]} ...")
+            del meg_state
+            self.module = model.cuda()
+        self._finish_initialize(tfcfg)
+
+    def _init_parallel(self, **mpu_kwargs) -> None:
+        """Parallel sizes and forward knobs from ``engine_config``; Megatron's process
+        groups (unless already initialized) and RNG seeds. ``mpu_kwargs`` go to
+        ``initialize_model_parallel``."""
+        from megatron.core import parallel_state as mpu
+        from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
         ec = self.engine_config
         tp = int(ec.get("tensor_model_parallel_size", 1))
@@ -296,6 +337,7 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 context_parallel_size=cp,
                 expert_model_parallel_size=ep,
                 expert_tensor_parallel_size=etp,
+                **mpu_kwargs,
             )
         model_parallel_cuda_manual_seed(seed)
 
@@ -303,6 +345,21 @@ class MegatronNativeEngine(MegatronBaseEngine):
         # rank's zigzag token pair and TE performs the cross-rank attention.
         self._is_first_stage = mpu.is_pipeline_first_stage()
         self._is_last_stage = mpu.is_pipeline_last_stage()
+
+    def _build_model(self):
+        """This rank's ``GPTModel`` from the HF config and ``engine_config``, before any
+        weights are loaded (on CPU for the HF-bridge families). Sets ``_tfcfg``, the
+        spec, the dims and the MoE fields."""
+        from megatron.core import parallel_state as mpu
+        from megatron.core.models.gpt.gpt_layer_specs import (
+            get_gpt_decoder_block_spec,
+            get_gpt_layer_with_transformer_engine_spec,
+        )
+        from megatron.core.models.gpt.gpt_model import GPTModel
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        ec = self.engine_config
+        tp, pp, cp, ep, etp, sp = self._tp, self._pp, self._cp, self._ep, self._etp, self._sp
 
         # ---- HF config -> Qwen3 dims / TransformerConfig (TE-compatible) ----
         cfg_path = os.path.join(self.model_name, "config.json")
@@ -484,51 +541,26 @@ class MegatronNativeEngine(MegatronBaseEngine):
             # vocab-parallel log-prob; that optimization is phase 2a-optional.)
             parallel_output=False,
         )
-
-        if not self._caps.supports_hf_bridge:
-            # DSv4 weights come from a torch_dist checkpoint converted offline
-            # (native FP8 -> bf16 HF -> torch_dist), because the released
-            # checkpoint is block-quantized FP8. ``dist_checkpointing.load``
-            # reshards it to this rank's TP/PP/EP on the way in.
-            ckpt = str(ec.get("dist_checkpoint_path") or self.model_name)
-            dsv4.materialize_dsv4(model)
-            report = dsv4.load_dsv4_dist_checkpoint(model, ckpt)
-            self.module = model
-            logger.info(
-                "MegatronNativeEngine[%d]: DSv4 loaded %.2fB params (%d tensors) from %s "
-                "| experts=%d topk=%d hash_layers=%d compress_ratios=%s hc_mult=%d "
-                "| tp=%d pp=%d cp=%d ep=%d etp=%d deterministic=%s",
-                self._rank(), report["num_params"] / 1e9, report["num_tensors"],
-                report["path"], tfcfg.num_moe_experts, tfcfg.moe_router_topk,
-                tfcfg.dsv4_n_hash_layers, tfcfg.dsv4_compress_ratios, tfcfg.dsv4_hc_mult,
-                tp, pp, cp, ep, etp, tfcfg.deterministic_mode,
-            )
-        else:
-            # ---- load HF weights via the TE-named bridge ----
-            logger.info(
-                "MegatronNativeEngine[%d]: loading HF weights (TE spec, moe=%s experts=%d "
-                "tp=%d pp=%d cp=%d ep=%d etp=%d) from %s",
-                self._rank(), self._is_moe, num_experts, tp, pp, cp, ep, etp, self.model_name,
-            )
-            hf_state = load_hf_safetensors(self.model_name)
-            if self._is_moe:
-                meg_state = self._shard_hf_for_moe(model, hf_state)
-            elif tp == 1 and pp == 1:
-                meg_state = hf_to_megatron(hf_state, self._dims, te=True)
-            else:
-                # TP/PP>1: each rank keeps only its model-parallel shard. For TP the
-                # tensor is sliced along the sharded axis; for PP only this stage's
-                # layers are kept (the local key's global layer index comes from the
-                # ShardedTensor's global_offset). See ``_shard_hf_for_mp``.
-                meg_state = self._shard_hf_for_mp(model, hf_state)
-            del hf_state
-            missing = model.load_state_dict(meg_state, strict=False)
-            real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
-            if real_missing:
-                raise RuntimeError(f"Native(TE) load missing keys: {real_missing[:6]} ...")
-            del meg_state
-            self.module = model.cuda()
         self._tfcfg = tfcfg
+        return model
+
+    def _hf_state_for_rank(self, model, hf_state) -> dict:
+        """This rank's Megatron state dict from full HF weights (HF-bridge families)."""
+        if self._is_moe:
+            return self._shard_hf_for_moe(model, hf_state)
+        if self._tp == 1 and self._pp == 1:
+            return hf_to_megatron(hf_state, self._dims, te=True)
+        # TP/PP>1: each rank keeps only its model-parallel shard. For TP the
+        # tensor is sliced along the sharded axis; for PP only this stage's
+        # layers are kept (the local key's global layer index comes from the
+        # ShardedTensor's global_offset). See ``_shard_hf_for_mp``.
+        return self._shard_hf_for_mp(model, hf_state)
+
+    def _finish_initialize(self, tfcfg) -> None:
+        """Topology log, then DDP, the distributed optimizer and the scheduler."""
+        ec = self.engine_config
+        tp, pp, cp, ep, etp = self._tp, self._pp, self._cp, self._ep, self._etp
+        num_experts = self._num_experts
 
         if self._is_moe and self._caps.supports_hf_bridge and self._rank() == 0:
             # Surface MoE + Expert-Parallel topology to the run log (stdout is
