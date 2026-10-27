@@ -1041,13 +1041,20 @@ class RLTrainer:
 
     def _resolve_mori_plan(self, cfg_dict: dict, n_trainer: int, n_rollout_workers: int) -> str:
         """``weight_sync.mori.plan``, or with ``auto`` the cached plan for this run's
-        trainer engine config and vLLM layout, built first if the cache has none."""
+        trainer engine config and vLLM layout, built first if the cache has none.
+        Rejects first what no plan serves: non-BF16 or quantized vLLM weights."""
         import json
         import subprocess
         import sys
         import tempfile
 
+        from lumenrl.tools.build_weight_map import check_engine_args, engine_config_of
+
         cfg = self.config.weight_sync.mori
+        if self.config.weight_sync.resolve_fp8_quantize():
+            raise NotImplementedError("MORI weight sync copies BF16 weights; trainer-side FP8 "
+                                      "quantization (weight_sync.fp8_quantize) is not supported")
+        check_engine_args(vllm_engine_kwargs(self.config), str(self.config.policy.model_name))
         if cfg.plan != "auto":
             if not cfg.plan:
                 raise ValueError("weight_sync.mori.plan is empty; use a plan.pt path or auto")
@@ -1059,7 +1066,6 @@ class RLTrainer:
             raise NotImplementedError(
                 "weight_sync.mori.plan=auto builds plans for megatron_native trainers and "
                 f"ray_http vLLM rollout, not {backend} / {self._gen_backend} ({transport})")
-        from lumenrl.tools.build_weight_map import engine_config_of
 
         tp = int(getattr(vcfg, "tensor_parallel_size", 1) or 1)
         if n_rollout_workers % tp:

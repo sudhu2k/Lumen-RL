@@ -46,6 +46,15 @@ def log(msg: str) -> None:
     print(f"[{time.time() - _T0:7.1f}s] {msg}", flush=True)
 
 
+def free_port() -> int:
+    """A TCP port nothing listens on now, so concurrent builds don't share a store."""
+    import socket
+
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
 # ---------------------------------------------------------------- trainer side
 
 def engine_config_of(config: dict) -> dict:
@@ -105,11 +114,9 @@ class SimulatedTrainer:
         self.coords: list[dict] = []
 
     def _run(self, real: bool) -> None:
-        import random
         import subprocess
 
-        cmd = ["torchrun", "--nproc-per-node", str(self.n),
-               "--master-port", str(29700 + random.randrange(200)),
+        cmd = ["torchrun", "--nproc-per-node", str(self.n), "--master-port", str(free_port()),
                "-m", "lumenrl.tools.trainer_shard_maps", "--model", self.model,
                "--out", self.ranks_dir, "--engine-config", self.config_path,
                "--threads", str(max(1, torch.get_num_threads() // self.n))]
@@ -271,7 +278,7 @@ class CpuVllm:
 
             parallel_state.init_model_parallel_group = groups_without_nccl
         else:
-            port = os.environ.get("WEIGHT_MAP_PORT", "29591")
+            port = os.environ.get("WEIGHT_MAP_PORT") or str(free_port())
             method = f"tcp://127.0.0.1:{port}"
         init_distributed_environment(world_size=world, rank=rank, local_rank=0, backend="gloo",
                                      distributed_init_method=method, timeout=timedelta(seconds=120))
@@ -326,11 +333,9 @@ class VllmRanks:
         self.groups: list[dict] = []
 
     def _run(self, real: bool) -> None:
-        import random
         import subprocess
 
-        cmd = ["torchrun", "--nproc-per-node", str(self.world),
-               "--master-port", str(29700 + random.randrange(200)),
+        cmd = ["torchrun", "--nproc-per-node", str(self.world), "--master-port", str(free_port()),
                "-m", "lumenrl.tools.vllm_shard_maps", "--model", self.model,
                "--out", os.path.join(self.out, "vllm_ranks"), "--tp", str(self.tp),
                "--pp", str(self.pp), "--dp", str(self.dp), "--pcp", str(self.pcp),
@@ -391,8 +396,77 @@ def vllm_key(tp: int = 1, pp: int = 1, dp: int = 1, pcp: int = 1, dcp: int = 1,
             "engine_args": {"dtype": "bfloat16", **(engine_args or {})}}
 
 
-def cache_key(index: CheckpointIndex, trainer: dict, vllm: dict, plan: dict) -> str:
-    blob = json.dumps({"checkpoint": index.fingerprint(), "trainer": trainer, "vllm": vllm,
+def checkpoint_dtype(model_dir: str) -> Optional[str]:
+    """The ``torch_dtype`` (or ``dtype``) the model's ``config.json`` declares."""
+    with open(os.path.join(model_dir, "config.json")) as f:
+        hf = json.load(f)
+    for c in (hf, hf.get("text_config") or {}):
+        for k in ("torch_dtype", "dtype"):
+            if c.get(k):
+                return str(c[k]).removeprefix("torch.")
+    return None
+
+
+def check_engine_args(engine_kwargs: dict, model_dir: str) -> None:
+    """Reject vLLM settings the maps can't serve: the plan copies BF16 bytes into vLLM's
+    parameters as loaded, so they must be BF16 and unquantized (computed parameters,
+    design 2.4, are not implemented)."""
+    if engine_kwargs.get("quantization"):
+        raise NotImplementedError(
+            f"MORI weight sync copies BF16 weights; vLLM quantization="
+            f"{engine_kwargs['quantization']!r} is not supported yet")
+    dtype = str(engine_kwargs.get("dtype") or "auto")
+    if dtype == "auto":
+        dtype = checkpoint_dtype(model_dir) or "unknown"
+    if dtype not in ("bfloat16", "bf16"):
+        raise NotImplementedError(f"MORI weight sync copies BF16 weights; vLLM dtype is {dtype}")
+
+
+_PLAN_CODE = ("lumenrl/engine/training", "lumenrl/transfer/weight_source_map.py",
+              "lumenrl/transfer/weight_plan.py", "lumenrl/tools/build_weight_map.py",
+              "lumenrl/tools/trainer_shard_maps.py", "lumenrl/tools/vllm_shard_maps.py")
+_PLAN_DISTS = {"torch": ("torch",), "megatron_core": ("megatron-core", "megatron_core"),
+               "transformer_engine": ("transformer-engine", "transformer_engine")}
+
+
+def code_versions() -> dict:
+    """What decides the trainer side's layout besides the config: a hash of Lumen-RL's
+    engine, transfer and tool sources (edits count, unrelated files don't), and the
+    installed torch, Megatron-core and TransformerEngine versions."""
+    from importlib import metadata
+
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    paths = []
+    for sub in _PLAN_CODE:
+        top = os.path.join(root, sub)
+        if os.path.isfile(top):
+            paths.append(top)
+        for d, dirs, files in os.walk(top):
+            dirs[:] = [x for x in dirs if x != "__pycache__"]
+            paths += [os.path.join(d, f) for f in files if f.endswith(".py")]
+    h = hashlib.sha1()
+    for path in sorted(paths):
+        h.update(os.path.relpath(path, root).encode())
+        with open(path, "rb") as fh:
+            h.update(fh.read())
+    out = {"lumenrl_sources": h.hexdigest()}
+    for key, names in _PLAN_DISTS.items():
+        out[key] = None
+        for name in names:
+            try:
+                out[key] = metadata.version(name)
+                break
+            except metadata.PackageNotFoundError:
+                pass
+    return out
+
+
+def cache_key(index: CheckpointIndex, model_dir: str, trainer: dict, vllm: dict,
+              plan: dict) -> str:
+    with open(os.path.join(model_dir, "config.json"), "rb") as f:
+        model_config = hashlib.sha1(f.read()).hexdigest()
+    blob = json.dumps({"checkpoint": index.fingerprint(), "model_config": model_config,
+                       "code": code_versions(), "trainer": trainer, "vllm": vllm,
                        "plan": plan}, sort_keys=True)
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
@@ -576,6 +650,7 @@ def main() -> None:
             vllm_kwargs = json.load(f)
     else:
         vllm_kwargs = vllm_engine_kwargs(cfg)
+    check_engine_args(vllm_kwargs, args.model)
     parallel, args.vllm_engine_args = split_vllm_args(vllm_kwargs)
     for name in ("tp", "pp", "dp", "pcp", "dcp"):
         setattr(args, f"vllm_{name}", int(parallel.get(name, 1)))
@@ -593,7 +668,7 @@ def main() -> None:
     index = CheckpointIndex.from_dir(args.model)
     plan_params = {"n_vllm": args.n_vllm, "round_mb": args.round_mb,
                    "max_piece_mb": args.max_piece_mb, "interleave": args.interleave}
-    key = cache_key(index, trainer_key(engine_config, args.n_trainer),
+    key = cache_key(index, args.model, trainer_key(engine_config, args.n_trainer),
                     vllm_key(args.vllm_tp, args.vllm_pp, args.vllm_dp, args.vllm_pcp,
                              args.vllm_dcp, args.vllm_ep, args.vllm_engine_args), plan_params)
 
