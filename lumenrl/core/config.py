@@ -787,10 +787,13 @@ class RDMAWeightSyncConfig:
 @dataclass
 class MoriWeightSyncConfig:
     """Pull over MORI-IO XGMI: rollout ranks read a cached plan's regions from the
-    trainers' parameters (``mori-weight-sync-design.md``). One node, BF16."""
+    trainers' parameters. One node, BF16."""
 
-    # plan.pt from ``python -m lumenrl.tools.build_weight_map`` for this model and layout.
-    plan: str = ""
+    # plan.pt from ``python -m lumenrl.tools.build_weight_map`` for this model and layout,
+    # or "auto": built at startup from this run's config (a few minutes, once per model
+    # and layout) and cached under plan_cache_dir, which the rollout workers must see.
+    plan: str = "auto"
+    plan_cache_dir: str = "~/.cache/lumenrl/weight_plans"
     window: int = 2  # rounds in flight per rollout rank
     num_streams: int = 64
     # One read per plan row, row stride included, when MORI has batch_read_strided;
