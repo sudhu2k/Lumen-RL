@@ -37,8 +37,11 @@ __all__ = [
     "Runs",
     "ParamMap",
     "SourceMap",
+    "apply_view",
     "capture",
+    "factor_view",
     "merge_rectangles",
+    "permutation_of",
 ]
 
 _ST_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
@@ -362,6 +365,57 @@ def merge_rectangles(runs: Runs) -> Runs:
                 torch.stack([t["cs"], t["st"]], 1))
 
 
+def permutation_of(loader: torch.Tensor, final: torch.Tensor) -> Optional[torch.Tensor]:
+    """``perm`` with ``final[i] == loader[perm[i]]``, or None if ``final`` is not a
+    permutation of ``loader`` (unwritten or repeated ids, or ids ``loader`` lacks)."""
+    if loader.numel() != final.numel() or bool((loader < 0).any()):
+        return None
+    order = torch.argsort(loader)
+    ls = loader[order]
+    if bool((ls[1:] == ls[:-1]).any()):
+        return None
+    pos = torch.searchsorted(ls, final).clamp_(max=ls.numel() - 1)
+    if not torch.equal(ls[pos], final):
+        return None
+    if bool((torch.bincount(pos, minlength=pos.numel()) != 1).any()):
+        return None
+    return order[pos]
+
+
+def factor_view(perm: torch.Tensor) -> Optional[dict]:
+    """``perm`` as one strided view of ``arange``: ``{"sizes", "strides", "offset"}`` with
+    ``arange(n).as_strided(sizes, strides, offset).reshape(-1) == perm``, or None.
+
+    Greedy, innermost first: the longest prefix stepping by a constant is one dimension;
+    every row of that length must step the same way, and the rows' starts are the next
+    level up. AITER's 30B-A3B ``w13`` comes out as sizes ``[12288, 256, 16, 8]``.
+    """
+    sizes: list[int] = []
+    strides: list[int] = []
+    cur = perm
+    while cur.numel() > 1:
+        d = cur[1] - cur[0]
+        if d < 0:  # as_strided takes no negative strides
+            return None
+        steps = cur[1:] - cur[:-1]
+        bad = torch.nonzero(steps != d)
+        r = int(bad[0]) + 1 if bad.numel() else cur.numel()
+        if cur.numel() % r:
+            return None
+        rows = cur.view(-1, r)
+        if r > 1 and not bool((rows[:, 1:] - rows[:, :-1] == d).all()):
+            return None
+        sizes.insert(0, r)
+        strides.insert(0, int(d))
+        cur = rows[:, 0].contiguous()
+    return {"sizes": sizes, "strides": strides, "offset": int(cur[0]) if cur.numel() else 0}
+
+
+def apply_view(view: dict, x: torch.Tensor) -> torch.Tensor:
+    """``x`` (flat) rearranged by a ``factor_view`` view: ``out[i] = x[perm[i]]``."""
+    return x.as_strided(view["sizes"], view["strides"], view["offset"]).reshape(-1)
+
+
 class _ParamDecoder:
     """Records one parameter's passes, then segments the assembled ids once."""
 
@@ -374,23 +428,41 @@ class _ParamDecoder:
         if self.map.valid:
             self.obs[k] = _pack(b)
 
+    def assemble(self, passes: list[Optional[int]],
+                 other: Optional[Mapping[Optional[int], torch.Tensor]] = None,
+                 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """The ids and the written mask (None: all written) from the recorded passes, with
+        ``other``'s bytes in place of a pass's where given (another stage's readback)."""
+        other = other or {}
+
+        def pass_bytes(k):
+            b = other.get(k)
+            if b is not None:
+                return b, (int(b[0]) if b.numel() and bool((b == b[0]).all()) else None)
+            p = self.obs[k]
+            expand = p.fill is None or (k is None and p.fill != 1)
+            return (p.bytes() if expand else None), p.fill
+
+        ones, fill = pass_bytes(None)
+        written = None if fill == 1 else (ones == 1)
+        ids = torch.zeros(self.obs[None].n, dtype=torch.int64)
+        # Byte k of an int64 id occupies lane k. This host is little-endian.
+        assert torch.tensor([1], dtype=torch.int64).view(torch.uint8)[0] == 1
+        view = ids.view(torch.uint8)
+        for k in passes:
+            if k is None:
+                continue
+            b, fill = pass_bytes(k)
+            if fill is None:
+                view[k::8] = b
+            elif fill != 0:
+                view[k::8] = fill
+        return ids, written
+
     def finish(self, passes: list[Optional[int]], bits: int) -> ParamMap:
         m = self.map
         if m.valid and self.obs:
-            ones = self.obs[None]
-            written = None if ones.fill == 1 else (ones.bytes() == 1)
-            ids = torch.zeros(ones.n, dtype=torch.int64)
-            # Byte k of an int64 id occupies lane k. This host is little-endian.
-            assert torch.tensor([1], dtype=torch.int64).view(torch.uint8)[0] == 1
-            view = ids.view(torch.uint8)
-            for k in passes:
-                if k is None:
-                    continue
-                p = self.obs[k]
-                if p.fill is None:
-                    view[k::8] = p.bytes()
-                elif p.fill != 0:
-                    view[k::8] = p.fill
+            ids, written = self.assemble(passes)
             runs = _segment(ids, written, 1 << bits, self.limit)
             if runs is None:
                 if written is not None:
@@ -514,6 +586,85 @@ def _pack(u: torch.Tensor) -> _Packed:
 ReadBack = Mapping[str, Mapping[str, torch.Tensor]]
 
 
+class _Permutations:
+    """Final-stage bytes of the parameters whose final stage differs from the loader's.
+
+    Parameters group by name with layer numbers erased, shape and dtype. The first of
+    each group keeps its final bytes in full, so its permutation can be derived and
+    factored into a view; the rest keep only fixed sample positions, enough to check
+    they move the same way.
+    """
+
+    SAMPLES = 1 << 20
+
+    def __init__(self) -> None:
+        self.groups: dict[tuple, list[str]] = {}
+        self.final: dict[str, dict[Optional[int], torch.Tensor]] = {}
+        self._pos: dict[int, torch.Tensor] = {}
+
+    def positions(self, n: int) -> torch.Tensor:
+        pos = self._pos.get(n)
+        if pos is None:
+            if n <= self.SAMPLES:
+                pos = torch.arange(n)
+            else:
+                gen = torch.Generator().manual_seed(n)
+                pos = torch.randint(n, (self.SAMPLES,), generator=gen)
+            pos = self._pos[n] = pos
+        return pos
+
+    def record(self, name: str, k: Optional[int], final: torch.Tensor, t: torch.Tensor) -> None:
+        import re
+
+        members = self.groups.setdefault(
+            (re.sub(r"\.\d+\.", ".#.", name), tuple(t.shape), t.dtype), [])
+        if name not in members:
+            members.append(name)
+        keep = final if members[0] == name else final[self.positions(final.numel())]
+        self.final.setdefault(name, {})[k] = keep.clone()
+
+    def resolve(self, decs: Mapping[str, _ParamDecoder], classes: Mapping[str, str],
+                passes: list[Optional[int]], log: Callable[[str], None]) -> dict[str, dict]:
+        """``{param: view}`` for every parameter whose final stage is its loader stage
+        moved by one strided view (``apply_view``)."""
+        views: dict[str, dict] = {}
+        for group in self.groups.values():
+            rep = group[0]
+            members = [m for m in group if classes.get(m) == "changed"
+                       and m in decs and decs[m].map.valid]
+            if not members or members[0] != rep:
+                continue
+            perm = self._derive(decs[rep], self.final.pop(rep), passes)
+            view = factor_view(perm) if perm is not None else None
+            if view is None:
+                log(f"{rep}: final stage is not one strided view of the loader stage")
+                continue
+            views[rep] = view
+            for m in members[1:]:
+                if self._check(decs[m], self.final.pop(m, {}), perm, passes):
+                    views[m] = view
+                else:
+                    log(f"{m}: does not move like {rep}")
+        return views
+
+    @staticmethod
+    def _derive(dec: _ParamDecoder, final: dict, passes) -> Optional[torch.Tensor]:
+        loader, lw = dec.assemble(passes)
+        moved, fw = dec.assemble(passes, final)
+        if lw is not None or fw is not None:
+            return None
+        return permutation_of(loader, moved)
+
+    def _check(self, dec: _ParamDecoder, final: dict, perm: torch.Tensor, passes) -> bool:
+        pos = self.positions(perm.numel())
+        src = perm[pos]
+        for k in passes:
+            want = final[k].to(torch.int64) if k in final else dec.obs[k].at(pos)
+            if not torch.equal(dec.obs[k].at(src), want):
+                return False
+        return True
+
+
 def capture(
     index: CheckpointIndex,
     run_pass: Callable[[Optional[int]], ReadBack],
@@ -540,13 +691,16 @@ def capture(
 
     Returns:
         ``({stage: SourceMap}, {param: class})``, class one of ``identity``
-        (b equals a), ``changed`` (b holds valid ids but differs: a permutation
-        candidate) or ``computed`` (b's values are not ids).
+        (b equals a), ``permutation`` (b is a moved by one strided view, stored
+        in ``maps[a].meta["permutations"][param]``; see ``apply_view``),
+        ``changed`` (b holds valid ids but differs some other way) or
+        ``computed`` (b's values are not ids).
     """
     import time
 
     decoders: dict[str, dict[str, _ParamDecoder]] = {s: {} for s in decode_stages}
     classes: dict[str, str] = {}
+    moved = _Permutations()
     passes: list[Optional[int]] = [None, *range(index.passes)]
     for k in passes:
         t0 = time.time()
@@ -576,14 +730,25 @@ def capture(
                 if same and a_dec is not None and a_dec.map.valid:
                     # Byte-equal to a stage that just passed the check: valid too.
                     classes[name] = prev
-                elif _as_bytes(tb, ones=k is None) is None:
+                    continue
+                fb = _as_bytes(tb, ones=k is None)
+                if fb is None:
                     classes[name] = "computed"
                 elif not same:
                     classes[name] = "changed"
+                    moved.record(name, k, fb, tb)
                 else:
                     classes[name] = prev
         del readback
         log(f"pass {'ones' if k is None else k}: {time.time() - t0:.1f}s")
+    views: dict[str, dict] = {}
+    if compare is not None and compare[0] in decoders:
+        t0 = time.time()
+        views = moved.resolve(decoders[compare[0]], classes, passes, log)
+        del moved
+        for name in views:
+            classes[name] = "permutation"
+        log(f"permutations: {len(views)} in {time.time() - t0:.1f}s")
     bits = 8 * index.passes
     maps = {}
     for stage, decs in decoders.items():
@@ -591,6 +756,8 @@ def capture(
         params = {n: d.finish(passes, bits) for n, d in decs.items()}
         meta = {"checkpoint": index.fingerprint(), "elements": index.total,
                 "passes": index.passes, "stage": stage}
+        if compare is not None and stage == compare[0]:
+            meta["permutations"] = views
         maps[stage] = SourceMap(params, meta)
         log(f"{stage} finish: {time.time() - t0:.1f}s")
     return maps, classes

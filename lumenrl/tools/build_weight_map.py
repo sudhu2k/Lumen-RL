@@ -37,7 +37,7 @@ from typing import Optional
 import torch
 
 from lumenrl.transfer.weight_plan import apply_plan, correspond, merge_plans, plan_rounds
-from lumenrl.transfer.weight_source_map import CheckpointIndex, SourceMap, capture
+from lumenrl.transfer.weight_source_map import CheckpointIndex, SourceMap, apply_view, capture
 
 _T0 = time.time()
 
@@ -375,7 +375,31 @@ def _rank_fingerprint(m: SourceMap) -> str:
         h.update(name.encode())
         h.update(_map_fingerprint(m.params[name]).encode())
     h.update(json.dumps(m.meta.get("classes", {}), sort_keys=True).encode())
+    h.update(json.dumps(m.meta.get("permutations", {}), sort_keys=True).encode())
     return h.hexdigest()
+
+
+def check_views(plan, views: dict, src, ref: dict, res: dict) -> None:
+    """Copy each ``permutation`` parameter's loader stage from the trainer's real weights,
+    move it by its view, and compare with vLLM's real final tensor."""
+    got = {n: torch.zeros_like(ref[n]) for n in plan.dst_names}
+    written = apply_plan(plan, 0, src, got)
+    for n, t in got.items():
+        res["views"] += 1
+        moved = apply_view(views[n], t.view(-1)).view(t.shape)
+        if torch.equal(moved, ref[n]) and written.get(n, 0) == t.numel() * t.element_size():
+            res["views_equal"] += 1
+        else:
+            res["mismatch"].append(("view", n))
+
+
+def view_summary(m: SourceMap) -> list[dict]:
+    """The distinct ``permutation`` views in a vLLM map and how many parameters use each."""
+    count: dict[str, int] = {}
+    for view in m.meta.get("permutations", {}).values():
+        k = json.dumps(view, sort_keys=True)
+        count[k] = count.get(k, 0) + 1
+    return [{**json.loads(k), "params": c} for k, c in sorted(count.items())]
 
 
 # ---------------------------------------------------------------- main
@@ -517,6 +541,7 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
             kinds[c] = kinds.get(c, 0) + 1
         report["vllm"] = {"build_s": round(time.time() - t0, 1), "classes": kinds,
                           "non_identity": sorted(n for n, c in classes.items() if c != "identity"),
+                          "permutations": view_summary(vmaps["loader"]),
                           **vmaps["loader"].stats()}
         vmaps["loader"].save(os.path.join(out, "vllm_map.pt"))
         log(f"vllm map: {report['vllm']}")
@@ -538,6 +563,14 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
                            holders=trainer.holders(copies.src_names), interleave=args.interleave)
         plan.meta["src_local_names"] = {n: trainer.local_name(n) for n in plan.src_names}
         plans.append((plan, copies))
+        moved = sorted(n for n, c in classes.items() if c == "permutation")
+        if args.verify and moved:
+            # Not part of the sync yet: only to check the views on real weights below.
+            pc = correspond(tmaps["loader"], g["map"], moved)
+            g["moved"] = (plan_rounds(pc, args.n_trainer, 1, args.round_mb << 20,
+                                      args.max_piece_mb << 20,
+                                      holders=trainer.holders(pc.src_names)),
+                          g["map"].meta["permutations"])
         tr = plan.meta["traffic"]
         log(f"plan: instance ranks {g['ranks']} x {args.n_vllm} replicas, "
             f"{copies.report['copies']} copies ({copies.report['line_copies']} as lines), "
@@ -546,7 +579,8 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
     report["plan"] = {"build_s": round(time.time() - t0, 1), "world": world,
                       "replicas": args.n_vllm, "traffic": plan.meta["traffic"],
                       "groups": [{"ranks": g["ranks"], "correspond": c.report,
-                                  "traffic": p.meta["traffic"]}
+                                  "traffic": p.meta["traffic"],
+                                  "permutations": view_summary(g["map"])}
                                  for (p, c), g in zip(plans, groups)]}
     plan.meta["key"] = key
     plan.save(os.path.join(out, "plan.pt"))
@@ -566,7 +600,8 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
             ranks._run(real=True)
         else:
             _, single = vm.load(vm.real_weights(), keep_loader_stage=False)
-        res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": [], "not_planned": []}
+        res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": [], "not_planned": [],
+               "views": 0, "views_equal": 0}
         dst_col = plan.col("dst_rank")
         for d in range(int(plan.meta["n_dst"])):
             r = d % world
@@ -584,12 +619,16 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
                     res["coverage_short"].append((d, n, written.get(n, 0)))
             res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(mine)))
             del got
+            g = next(g for g in groups if r in g["ranks"])
+            if d < world and "moved" in g:
+                check_views(*g["moved"], src, ref, res)
             if ranks is not None:
                 del ref
         res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
         res["verify_s"] = round(time.time() - t0, 1)
         report["verify"] = res
-        log(f"verify: {res['equal']}/{res['params']} equal, not planned {res['not_planned']}")
+        log(f"verify: {res['equal']}/{res['params']} equal, not planned {res['not_planned']}; "
+            f"views {res['views_equal']}/{res['views']} equal")
 
     report["total_s"] = round(time.time() - _T0, 1)
     with open(os.path.join(out, "report.json"), "w") as f:
