@@ -380,8 +380,12 @@ def merge_plans(groups: list[tuple[Plan, list[int]]], world: int, replicas: int)
     src_names: list[str] = []
     dst_at: dict[str, int] = {}
     src_at: dict[str, int] = {}
-    parts, local = [], {}
+    parts, local, views, not_synced = [], {}, {}, set()
     for plan, ranks in groups:
+        for n, v in (plan.meta.get("views") or {}).items():
+            if views.setdefault(n, v) != v:
+                raise ValueError(f"{n} is permuted differently on different rollout ranks")
+        not_synced |= set(plan.meta.get("not_synced") or ())
         if int(plan.meta["n_dst"]) != len(ranks) * replicas:
             raise ValueError(f"plan for {plan.meta['n_dst']} rollout ranks, expected "
                              f"{len(ranks)} x {replicas}")
@@ -409,7 +413,8 @@ def merge_plans(groups: list[tuple[Plan, list[int]]], world: int, replicas: int)
                 {k: first[k] for k in ("n_src", "round_bytes", "max_piece_bytes", "interleave")
                  if k in first})
     plan.meta.update(n_dst=world * replicas, vllm_world=world, vllm_replicas=replicas,
-                     src_local_names=local, traffic=plan.traffic(),
+                     src_local_names=local, views=views, not_synced=sorted(not_synced),
+                     traffic=plan.traffic(),
                      model_bytes=int(plan.nbytes().sum()) // replicas)
     return plan
 

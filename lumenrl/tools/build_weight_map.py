@@ -379,20 +379,6 @@ def _rank_fingerprint(m: SourceMap) -> str:
     return h.hexdigest()
 
 
-def check_views(plan, views: dict, src, ref: dict, res: dict) -> None:
-    """Copy each ``permutation`` parameter's loader stage from the trainer's real weights,
-    move it by its view, and compare with vLLM's real final tensor."""
-    got = {n: torch.zeros_like(ref[n]) for n in plan.dst_names}
-    written = apply_plan(plan, 0, src, got)
-    for n, t in got.items():
-        res["views"] += 1
-        moved = apply_view(views[n], t.view(-1)).view(t.shape)
-        if torch.equal(moved, ref[n]) and written.get(n, 0) == t.numel() * t.element_size():
-            res["views_equal"] += 1
-        else:
-            res["mismatch"].append(("view", n))
-
-
 def view_summary(m: SourceMap) -> list[dict]:
     """The distinct ``permutation`` views in a vLLM map and how many parameters use each."""
     count: dict[str, int] = {}
@@ -553,24 +539,21 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
     t0 = time.time()
     for g in groups:
         classes = g["classes"]
-        identity = [n for n, c in classes.items()
-                    if c == "identity" and g["map"].params[n].valid]
-        copies = correspond(tmaps["loader"], g["map"], sorted(identity))
+        views = g["map"].meta.get("permutations", {})
+        # Permuted parameters are read in their loader-stage layout (the map is the
+        # loader stage's) and moved into place by their view on the rollout GPU.
+        synced = sorted(n for n, c in classes.items()
+                        if c in ("identity", "permutation") and g["map"].params[n].valid)
+        copies = correspond(tmaps["loader"], g["map"], synced)
         if copies.report["overlapping_src_runs"]:
             raise RuntimeError(f"{copies.report['overlapping_src_runs']} trainer runs overlap")
         plan = plan_rounds(copies, args.n_trainer, len(g["ranks"]) * args.n_vllm,
                            args.round_mb << 20, args.max_piece_mb << 20,
                            holders=trainer.holders(copies.src_names), interleave=args.interleave)
         plan.meta["src_local_names"] = {n: trainer.local_name(n) for n in plan.src_names}
+        plan.meta["views"] = {n: views[n] for n in synced if classes[n] == "permutation"}
+        plan.meta["not_synced"] = sorted(set(classes) - set(synced))
         plans.append((plan, copies))
-        moved = sorted(n for n, c in classes.items() if c == "permutation")
-        if args.verify and moved:
-            # Not part of the sync yet: only to check the views on real weights below.
-            pc = correspond(tmaps["loader"], g["map"], moved)
-            g["moved"] = (plan_rounds(pc, args.n_trainer, 1, args.round_mb << 20,
-                                      args.max_piece_mb << 20,
-                                      holders=trainer.holders(pc.src_names)),
-                          g["map"].meta["permutations"])
         tr = plan.meta["traffic"]
         log(f"plan: instance ranks {g['ranks']} x {args.n_vllm} replicas, "
             f"{copies.report['copies']} copies ({copies.report['line_copies']} as lines), "
@@ -611,7 +594,12 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
             written = apply_plan(plan, d, src, got)
             for n in mine:
                 res["params"] += 1
+                view = plan.meta["views"].get(n)
+                if view is not None:
+                    res["views"] += 1
+                    got[n] = apply_view(view, got[n].view(-1), torch.empty_like(got[n]))
                 if torch.equal(got[n], ref[n]):
+                    res["views_equal"] += view is not None
                     res["equal"] += 1
                 else:
                     res["mismatch"].append((d, n))
@@ -619,9 +607,6 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
                     res["coverage_short"].append((d, n, written.get(n, 0)))
             res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(mine)))
             del got
-            g = next(g for g in groups if r in g["ranks"])
-            if d < world and "moved" in g:
-                check_views(*g["moved"], src, ref, res)
             if ranks is not None:
                 del ref
         res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
