@@ -1208,10 +1208,17 @@ class RLTrainer:
             self._last_weight_sync_metrics["timing/weight_sync_mori_hash_s"] = max(
                 float(r.get("hash_s", 0.0)) for r in rows
             )
+        permuted = max(int(r.get("permuted", 0)) for r in rows)
+        staged = ""
+        if permuted:
+            # Time after the direct rounds: the permuted tensors' reads and view copies.
+            staged_s = max(float(r["seconds"]) - float(r["direct_s"]) for r in rows)
+            self._last_weight_sync_metrics["timing/weight_sync_mori_staged_s"] = staged_s
+            staged = f" (of which {permuted} permuted tensors {staged_s:.3f}s)"
         logger.info(
             "MORI weight sync committed: version=%d bytes=%.1fGB over %d rollout ranks "
-            "transfer=%.3fs rpc=%.3fs total=%.3fs verified=%s",
-            version, nbytes / 1e9, len(rows), transfer_s, read_s, total_s, verify,
+            "transfer=%.3fs%s rpc=%.3fs total=%.3fs verified=%s",
+            version, nbytes / 1e9, len(rows), transfer_s, staged, read_s, total_s, verify,
         )
         if sleeping:
             rollout_engine.wake(tags=["kv_cache"])

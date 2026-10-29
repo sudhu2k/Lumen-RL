@@ -6,6 +6,9 @@ where every plan source lives in them. Each rollout rank registers one span over
 its own parameters, checks every read of its share of the plan against both
 sides' sizes, and turns each round into one ``IOEngine.batch_read`` across all
 (source rank, registration) pairs. Nothing runs on the trainer per sync.
+Parameters the engine permutes after loading (AITER's MoE shuffle) are read in
+their loader-stage layout into a staging slot, one tensor at a time, and moved
+into place by the plan's strided view.
 
 Verification hashes every plan read on both sides (``read_hashes``): a
 position-weighted sum of the read's 16-bit words, so a shifted, swapped or stale
@@ -23,6 +26,7 @@ from typing import Any, Mapping
 import torch
 
 from lumenrl.transfer.weight_plan import Plan
+from lumenrl.transfer.weight_source_map import apply_view, unapply_view
 
 __all__ = ["MoriWeightSource", "MoriWeightReader", "SourceExport", "read_entries",
            "check_bounds", "read_hashes", "compare_hashes", "load_plan"]
@@ -232,7 +236,17 @@ class MoriWeightReader:
         missing = [plan.dst_names[q] for q in used if plan.dst_names[q] not in params]
         if missing:
             raise KeyError(f"rollout engine lacks {len(missing)} plan params, e.g. {missing[:5]}")
+        names = {plan.dst_names[q] for q in used}
+        stale = [n for n in plan.meta.get("not_synced") or () if n in params and n not in names]
+        if stale:
+            raise ValueError(f"MORI weight plan cannot sync {len(stale)} rollout parameters "
+                             f"(neither copies nor permutations of trainer weights), e.g. "
+                             f"{stale[:5]}")
         self.tensors = {q: params[plan.dst_names[q]] for q in used}
+        views = plan.meta.get("views") or {}
+        # Permuted parameters: read in their loader-stage layout into a staging slot,
+        # then moved into place by one strided copy (``apply_view``).
+        self.views = {q: views[plan.dst_names[q]] for q in used if plan.dst_names[q] in views}
         by_rank = {s.src_rank: s for s in sources}
         check_bounds(self.rows, {q: t.numel() * t.element_size() for q, t in self.tensors.items()},
                      {(s.src_rank, q): v[2] for s in sources for q, v in s.params.items()}, plan)
@@ -243,13 +257,20 @@ class MoriWeightReader:
         for s in sources:
             self.eng.register_remote_engine(EngineDesc.unpack(s.engine))
         remote = {s.src_rank: [MemoryDesc.unpack(m) for m in s.memories] for s in sources}
-        lo = min(t.data_ptr() for t in self.tensors.values())
-        hi = max(t.data_ptr() + t.numel() * t.element_size() for t in self.tensors.values())
-        self.local = _register(self.eng, lo, hi - lo, self.device)
+        direct = [t for q, t in self.tensors.items() if q not in self.views]
+        lo = min((t.data_ptr() for t in direct), default=0)
+        hi = max((t.data_ptr() + t.numel() * t.element_size() for t in direct), default=0)
+        self.local = _register(self.eng, lo, hi - lo, self.device) if direct else None
         at = {q: t.data_ptr() - lo for q, t in self.tensors.items()}
+        # Two slots: one tensor's reads land in one while the other is moved into place.
+        slot_bytes = max((self.tensors[q].numel() * self.tensors[q].element_size()
+                          for q in self.views), default=0)
+        self.slots = [torch.empty(slot_bytes, dtype=torch.uint8, device=self.device)
+                      for _ in range(2 if len(self.views) > 1 else len(self.views))]
+        self.slot_mems = [_register(self.eng, s.data_ptr(), slot_bytes, self.device)
+                          for s in self.slots]
+        self.staging_bytes = slot_bytes * len(self.slots)
 
-        n_rounds = int(self.rows[:, _ROUND].max()) + 1
-        groups: list[dict[tuple[int, int], tuple[list, ...]]] = [{} for _ in range(n_rounds)]
         # strided: one read per plan row, rows and pitches included (MORI's
         # batch_read_strided, if this MORI has it); otherwise one contiguous read per row.
         self.strided = bool(strided) and hasattr(self.eng, "batch_read_strided")
@@ -258,18 +279,30 @@ class MoriWeightReader:
                              r[_DS], r[_SS]) for r in self.rows.tolist()]
         else:
             self.entries = [(*e, 1, e[6], e[6]) for e in read_entries(self.rows)]
-        for rnd, s, dp, do, sp, so, n, nr, ds, ss in self.entries:
-            mem, base, _ = by_rank[s].params[sp]
-            g = groups[rnd].setdefault((s, mem), ([], [], [], [], [], []))
-            for col, v in zip(g, (at[dp] + do, base + so, n, nr, ds, ss)):
-                col.append(v)
-        self.calls = []
-        for g in groups:
-            keys = list(g)
-            if keys:
-                self.calls.append(([self.local] * len(keys), [g[k][0] for k in keys],
-                                   [remote[k[0]][k[1]] for k in keys],
-                                   *([g[k][c] for k in keys] for c in range(1, 6))))
+
+        def batches(entries, local, offset) -> list[tuple]:
+            """``entries`` as one batch per round, one read list per (source, memory)."""
+            by_round: dict[int, dict[tuple[int, int], tuple[list, ...]]] = {}
+            for rnd, s, dp, do, sp, so, n, nr, ds, ss in entries:
+                mem, base, _ = by_rank[s].params[sp]
+                g = by_round.setdefault(rnd, {}).setdefault((s, mem), ([], [], [], [], [], []))
+                for col, v in zip(g, (offset(dp) + do, base + so, n, nr, ds, ss)):
+                    col.append(v)
+            out = []
+            for rnd in sorted(by_round):
+                g = by_round[rnd]
+                keys = list(g)
+                out.append(([local] * len(keys), [g[k][0] for k in keys],
+                            [remote[k[0]][k[1]] for k in keys],
+                            *([g[k][c] for k in keys] for c in range(1, 6))))
+            return out
+
+        self.calls = batches([e for e in self.entries if e[2] not in self.views],
+                             self.local, at.__getitem__)
+        # Per permuted tensor and slot: all its reads as one batch (rounds merged).
+        self.staged = [(q, [batches([(0, *e[1:]) for e in self.entries if e[2] == q],
+                                    mem, lambda _: 0)[0] for mem in self.slot_mems])
+                       for q in sorted(self.views)]
         self.bytes = int(sum(e[6] * e[7] for e in self.entries))
         self.setup_s = time.perf_counter() - t0
 
@@ -287,29 +320,70 @@ class MoriWeightReader:
                 elif not st.Succeeded():
                     failures.append("")
 
-        for ld, lo, rd, ro, sz, nr, lp, rp in self.calls:
-            while len(pending) >= self.window:
-                drain(pending.pop(0))
+        def issue(call):
+            ld, lo, rd, ro, sz, nr, lp, rp = call
             uids = [self.eng.allocate_transfer_uid() for _ in sz]
             if self.strided:
-                pending.append(self.eng.batch_read_strided(ld, lo, rd, ro, sz, nr, lp, rp, uids))
-            else:
-                pending.append(self.eng.batch_read(ld, lo, rd, ro, sz, uids))
+                return self.eng.batch_read_strided(ld, lo, rd, ro, sz, nr, lp, rp, uids)
+            return self.eng.batch_read(ld, lo, rd, ro, sz, uids)
+
+        for call in self.calls:
+            while len(pending) >= self.window:
+                drain(pending.pop(0))
+            pending.append(issue(call))
         for statuses in pending:
             drain(statuses)
+        t_direct = time.perf_counter() - t0
+
+        # Permuted tensors: tensor i reads into slot i % 2 once the copy out of that
+        # slot (tensor i - 2) is done; tensor i + 1's reads overlap tensor i's copy.
+        done: list = [None] * len(self.slots)
+        staged: list = []
+
+        def place(q, slot, statuses) -> None:
+            drain(statuses)
+            t = self.tensors[q]
+            src = self.slots[slot][:t.numel() * t.element_size()].view(t.dtype)
+            apply_view(self.views[q], src, t)
+            done[slot] = torch.cuda.Event()
+            done[slot].record()
+
+        for i, (q, calls) in enumerate(self.staged):
+            slot = i % len(self.slots)
+            if done[slot] is not None:
+                done[slot].synchronize()
+            staged.append((q, slot, issue(calls[slot])))
+            if len(staged) == len(self.slots):
+                place(*staged.pop(0))
+        for args in staged:
+            place(*args)
         torch.cuda.synchronize(self.device)
         seconds = time.perf_counter() - t0
         if failures:
             raise RuntimeError(f"MORI weight sync: {len(failures)} batch reads failed on rollout "
                                f"rank {self.dst_rank}: {[f for f in failures if f][:4]}")
         return {"seconds": seconds, "bytes": float(self.bytes), "rounds": float(len(self.calls)),
-                "reads": float(len(self.entries)),
+                "reads": float(len(self.entries)), "direct_s": t_direct,
+                "permuted": float(len(self.staged)),
                 "gbps": self.bytes / seconds / 1e9 if seconds > 0 else 0.0}
 
     def hashes(self) -> torch.Tensor:
-        """Hash of every plan read for this rank, in plan row order."""
-        flat = {q: _flat(t) for q, t in self.tensors.items()}
-        return read_hashes(self.rows, flat, _DP, _DO, _DS)
+        """Hash of every plan read for this rank, in plan row order. A permuted tensor's
+        reads are in its loader-stage layout, rebuilt from the tensor into a slot."""
+        flat = {q: _flat(t) for q, t in self.tensors.items() if q not in self.views}
+        dp = self.rows[:, _DP]
+        out = torch.zeros(self.rows.shape[0], dtype=torch.int64)
+        direct = torch.ones_like(dp, dtype=torch.bool)
+        for q, view in self.views.items():
+            mine = dp == q
+            direct &= ~mine
+            t = self.tensors[q]
+            nbytes = t.numel() * t.element_size()
+            loader = self.slots[0][:nbytes].view(t.dtype)
+            unapply_view(view, t, loader)
+            out[mine] = read_hashes(self.rows[mine], {q: loader.view(torch.uint8)}, _DP, _DO, _DS)
+        out[direct] = read_hashes(self.rows[direct], flat, _DP, _DO, _DS)
+        return out
 
 
 def compare_hashes(plan: Plan, dst_rank: int, dst: torch.Tensor,

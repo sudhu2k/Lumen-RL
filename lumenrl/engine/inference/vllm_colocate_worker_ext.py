@@ -483,12 +483,14 @@ class vLLMColocateWorkerExtension:
         r = self._mori_reader
         logger.warning(
             "MORI weight reader on rollout rank %d: %d reads in %d rounds, %.2f GB, "
-            "strided %s, setup %.2fs",
-            dst_rank, len(r.entries), len(r.calls), r.bytes / 1e9, r.strided, r.setup_s,
+            "strided %s, %d permuted tensors through %.2f GB staging, setup %.2fs",
+            dst_rank, len(r.entries), len(r.calls), r.bytes / 1e9, r.strided, len(r.views),
+            r.staging_bytes / 1e9, r.setup_s,
         )
         out: dict[str, object] = {"dst_rank": dst_rank, "reads": len(r.entries),
                                   "rounds": len(r.calls), "bytes": r.bytes, "setup_s": r.setup_s,
-                                  "strided": r.strided}
+                                  "strided": r.strided, "permuted": len(r.views),
+                                  "staging_bytes": r.staging_bytes}
         if hash_before:
             out["hashes"] = r.hashes().tolist()
         return out

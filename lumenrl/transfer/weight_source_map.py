@@ -42,6 +42,7 @@ __all__ = [
     "factor_view",
     "merge_rectangles",
     "permutation_of",
+    "unapply_view",
 ]
 
 _ST_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
@@ -411,9 +412,22 @@ def factor_view(perm: torch.Tensor) -> Optional[dict]:
     return {"sizes": sizes, "strides": strides, "offset": int(cur[0]) if cur.numel() else 0}
 
 
-def apply_view(view: dict, x: torch.Tensor) -> torch.Tensor:
-    """``x`` (flat) rearranged by a ``factor_view`` view: ``out[i] = x[perm[i]]``."""
-    return x.as_strided(view["sizes"], view["strides"], view["offset"]).reshape(-1)
+def apply_view(view: dict, x: torch.Tensor, out: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """``x`` (flat) rearranged by a ``factor_view`` view: ``out[i] = x[perm[i]]``, as one
+    strided copy into ``out`` (contiguous, same numel) when given."""
+    src = x.as_strided(view["sizes"], view["strides"], x.storage_offset() + view["offset"])
+    if out is None:
+        return src.reshape(-1)
+    out.view(view["sizes"]).copy_(src)
+    return out
+
+
+def unapply_view(view: dict, y: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """The inverse of ``apply_view``: ``out`` (flat) such that ``apply_view(view, out)``
+    equals ``y``."""
+    out.as_strided(view["sizes"], view["strides"],
+                   out.storage_offset() + view["offset"]).copy_(y.reshape(view["sizes"]))
+    return out
 
 
 class _ParamDecoder:
