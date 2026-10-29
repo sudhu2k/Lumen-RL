@@ -75,6 +75,16 @@ def _truth(index, loader):
     return loader(hf)
 
 
+@pytest.mark.parametrize("start", [0, 1, 255, 256, 65_530, (1 << 24) - 3, (1 << 33) + 77,
+                                   (1 << 40) - 5])
+@pytest.mark.parametrize("n", [0, 1, 7, 256, 300, 70_000])
+def test_id_tensor_is_byte_k_of_ids(start, n):
+    index = CheckpointIndex([CheckpointTensor("t", (n,), "BF16", start, n)])
+    ids = torch.arange(start, start + n, dtype=torch.int64)
+    for k in range(6):
+        assert torch.equal(index.id_tensor("t", k), ((ids >> (8 * k)) & 255).to(torch.bfloat16))
+
+
 @pytest.mark.parametrize("base", [0, (1 << 33) + 77])
 def test_decoded_ids_match_loader_on_int64_ids(base):
     index = _index(base)
@@ -106,18 +116,22 @@ def test_padding_and_transpose():
     assert set(t.runs.as_lines().ckpt_strides[:, 0].tolist()) == {D.ffn}
 
 
-def test_classification_identity_changed_computed():
+def test_classification_identity_permutation_changed_computed():
     index = _index(5000)
+    down = "model.layers.0.mlp.down_proj.weight"
+    shuffle = torch.randperm(D.hidden * D.ffn, generator=torch.Generator().manual_seed(0))
 
     def run(k):
         loader = _rollout(index.id_state(k))
         final = {n: t.clone() for n, t in loader.items()}
         final["model.layers.0.mlp.gate_up_proj.weight"] = _tile(final["model.layers.0.mlp.gate_up_proj.weight"])
+        final[down] = final[down].reshape(-1)[shuffle].view(final[down].shape)
         final["model.norm.weight"] = final["model.norm.weight"] * 0.5
         return {"loader": loader, "final": final}
 
     _, classes = capture(index, run, compare=("loader", "final"), log=lambda s: None)
-    assert classes["model.layers.0.mlp.gate_up_proj.weight"] == "changed"
+    assert classes["model.layers.0.mlp.gate_up_proj.weight"] == "permutation"
+    assert classes[down] == "changed"
     assert classes["model.norm.weight"] == "computed"
     assert classes["model.layers.1.mlp.gate_up_proj.weight"] == "identity"
 
