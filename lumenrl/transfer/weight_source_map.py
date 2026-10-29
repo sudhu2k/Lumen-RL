@@ -116,8 +116,7 @@ class CheckpointIndex:
             raise TypeError(f"{name}: id passes support {sorted(_ST_DTYPES)}, not {t.dtype}")
         if k is None:
             return torch.ones(t.shape, dtype=dtype)
-        ids = torch.arange(t.start, t.start + t.numel, dtype=torch.int64)
-        return ((ids >> (8 * k)) & 255).to(dtype).view(t.shape)
+        return _id_bytes(t.start, t.numel, k).to(dtype).view(t.shape)
 
     def id_tensors(self, k: Optional[int]) -> Iterator[tuple[str, torch.Tensor]]:
         """The whole id checkpoint for pass ``k``, one tensor at a time."""
@@ -127,6 +126,35 @@ class CheckpointIndex:
     def id_state(self, k: Optional[int]) -> dict[str, torch.Tensor]:
         """The whole id checkpoint for pass ``k`` as a dict, for loaders that want one."""
         return dict(self.id_tensors(k))
+
+
+_BYTE_CYCLE = torch.arange(256, dtype=torch.uint8)
+
+
+def _id_bytes(start: int, n: int, k: int) -> torch.Tensor:
+    """``(id >> 8k) & 255`` for ids ``start .. start+n-1``, as uint8.
+
+    Written without the int64 ids: byte 0 cycles through 0-255, and byte k >= 1 is
+    constant over each aligned block of 256**k ids, so the blocks are one broadcast
+    fill. One byte is written per element instead of several int64 temporaries.
+    """
+    if k == 0:
+        o = start & 255
+        return _BYTE_CYCLE.repeat((n + o) // 256 + 1)[o:o + n]
+    w = 1 << (8 * k)
+    out = torch.empty(n, dtype=torch.uint8)
+    head = min(n, -start % w)
+    if head:
+        out[:head] = (start >> (8 * k)) & 255
+    m = (n - head) // w
+    if m:
+        first = (start + head) >> (8 * k)
+        out[head:head + m * w].view(m, w)[:] = (torch.arange(first, first + m) & 255).to(
+            torch.uint8)[:, None]
+    tail = head + m * w
+    if tail < n:
+        out[tail:] = ((start + tail) >> (8 * k)) & 255
+    return out
 
 
 @dataclass
