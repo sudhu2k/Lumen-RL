@@ -385,10 +385,11 @@ class VLLMRayServer:
     async def init_mori_weight_sync(self, **kwargs: Any) -> Any:
         return await self.engine.collective_rpc("init_mori_weight_sync", kwargs=kwargs)
 
-    async def receive_weights_mori(self, version: int, verify: bool = False) -> Any:
+    async def receive_weights_mori(self, version: int, verify: bool = False,
+                                   digest: bool = False) -> Any:
         stats = await self.engine.collective_rpc(
             "receive_weights_mori",
-            kwargs={"version": int(version), "verify": bool(verify)},
+            kwargs={"version": int(version), "verify": bool(verify), "digest": bool(digest)},
         )
         await self.engine.reset_prefix_cache()
         return stats
@@ -891,9 +892,10 @@ class VLLMReplicaManager:
         ])
         return exports, _by_rollout_rank(readers)
 
-    def start_receive_weights_mori(self, *, version: int, verify: bool) -> list:
+    def start_receive_weights_mori(self, *, version: int, verify: bool,
+                                   digest: bool = False) -> list:
         """One ref per replica; ``mori_rows`` turns their results into per-rank stats."""
-        return [server.receive_weights_mori.remote(int(version), bool(verify))
+        return [server.receive_weights_mori.remote(int(version), bool(verify), bool(digest))
                 for server in self.servers]
 
     @staticmethod

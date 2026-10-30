@@ -476,6 +476,14 @@ class vLLMColocateWorkerExtension:
                              f"{plan.meta.get('vllm_world', 1)} ranks; this one has {world}")
         dst_rank = int(replica) * world + int(world_group.rank_in_group)
         model = self.model_runner.model
+        if plan.meta.get("staged_checkpoint"):
+            return self._init_mori_checkpoint_reader(plan, dst_rank, sources, num_streams,
+                                                     strided, hash_before)
+        from lumenrl.engine.inference.vllm_fp8_utils import is_online_quant_model
+
+        if is_online_quant_model(self.model_runner.vllm_config):
+            raise ValueError(f"MORI weight plan {plan_path} copies into BF16 parameters; this "
+                             "vLLM quantizes online and needs a plan built for it")
         self._mori_reader = MoriWeightReader(
             plan, dst_rank, dict(model.named_parameters()), list(sources),
             window=int(window), num_streams=int(num_streams), strided=bool(strided),
@@ -495,18 +503,94 @@ class vLLMColocateWorkerExtension:
             out["hashes"] = r.hashes().tolist()
         return out
 
-    def receive_weights_mori(self, version: int, verify: bool = False) -> dict[str, object]:
-        """Read every plan region from the trainers; with ``verify`` also hash them."""
+    def _init_mori_checkpoint_reader(self, plan, dst_rank: int, sources: list,
+                                     num_streams: int, strided: bool,
+                                     hash_before: bool) -> dict[str, object]:
+        """A plan into checkpoint tensors: vLLM quantizes online, so each sync stages the
+        BF16 tensors and loads them through its own layerwise reload. ``hash_before``
+        returns a digest of every parameter as vLLM loaded it, for the startup check."""
+        from lumenrl.engine.inference.vllm_fp8_utils import is_online_quant_model
+        from lumenrl.transfer.mori_weight_transfer import MoriCheckpointReader
+
+        if not is_online_quant_model(self.model_runner.vllm_config):
+            raise ValueError(f"MORI weight plan is for online quantization "
+                             f"{plan.meta.get('quantization')!r}; this vLLM is not quantizing "
+                             "online")
+        self._mori_reader = r = MoriCheckpointReader(
+            plan, dst_rank, list(sources), device=torch.cuda.current_device(),
+            num_streams=int(num_streams), strided=bool(strided),
+        )
+        logger.warning(
+            "MORI checkpoint reader on rollout rank %d: %d reads into %d checkpoint tensors "
+            "in %d batches, %.2f GB, %.2f GB staging, strided %s, setup %.2fs",
+            dst_rank, len(r.entries), len(r.specs), len(r.batches), r.bytes / 1e9,
+            r.staging_bytes / 1e9, r.strided, r.setup_s,
+        )
+        out: dict[str, object] = {"dst_rank": dst_rank, "reads": len(r.entries),
+                                  "rounds": len(r.batches), "bytes": r.bytes,
+                                  "setup_s": r.setup_s, "strided": r.strided,
+                                  "staging_bytes": r.staging_bytes, "staged_checkpoint": True}
+        if hash_before:
+            out["digest"] = self.mori_param_digest()
+        return out
+
+    def mori_param_digest(self) -> dict[str, int]:
+        """A digest of every vLLM parameter's bytes (FP8 weights and their scales)."""
+        from lumenrl.transfer.mori_weight_transfer import tensor_digest
+
+        return {n: tensor_digest(p) for n, p in self.model_runner.model.named_parameters()}
+
+    def receive_weights_mori(self, version: int, verify: bool = False,
+                             digest: bool = False) -> dict[str, object]:
+        """Read every plan region from the trainers; with ``verify`` also hash them, with
+        ``digest`` return every parameter's digest afterwards."""
+        from lumenrl.transfer.mori_weight_transfer import MoriCheckpointReader
+
         r = getattr(self, "_mori_reader", None)
         if r is None:
             raise RuntimeError("MORI weight reader is not initialized")
-        stats: dict[str, object] = {"version": float(version), "dst_rank": r.dst_rank,
-                                    **r.sync()}
+        if isinstance(r, MoriCheckpointReader):
+            stats = {"version": float(version), "dst_rank": r.dst_rank,
+                     **self._sync_mori_checkpoint(r, verify)}
+        else:
+            stats = {"version": float(version), "dst_rank": r.dst_rank, **r.sync()}
         if verify:
             t0 = time.perf_counter()
             stats["hashes"] = r.hashes().tolist()
             stats["hash_s"] = time.perf_counter() - t0
+        if digest:
+            stats["digest"] = self.mori_param_digest()
         return stats
+
+    def _sync_mori_checkpoint(self, r, verify: bool) -> dict[str, object]:
+        """One sync through vLLM's layerwise reload: the staged BF16 tensors go to
+        ``load_weights`` and each layer is quantized once it is complete."""
+        from lumenrl.engine.inference.vllm_fp8_utils import (
+            finalize_online_quantized_weights_loading,
+            prepare_online_quantized_weights_for_loading,
+        )
+
+        model = self.model_runner.model
+        model_config = self.model_runner.vllm_config.model_config
+        t0 = time.perf_counter()
+        prepare_online_quantized_weights_for_loading(model)
+        prepare_s = time.perf_counter() - t0
+        try:
+            stats = r.sync(model.load_weights, verify=verify)
+        except BaseException:
+            try:
+                finalize_online_quantized_weights_loading(model, model_config)
+            except BaseException as exc:
+                logger.warning("secondary online FP8 finalize failure after MORI sync "
+                               "error: %s", exc)
+            raise
+        t0 = time.perf_counter()
+        finalize_online_quantized_weights_loading(model, model_config)
+        torch.cuda.synchronize()
+        finalize_s = time.perf_counter() - t0
+        return {**stats, "prepare_s": prepare_s, "finalize_s": finalize_s,
+                "seconds": stats["seconds"] + prepare_s + finalize_s,
+                "transfer_s": stats["seconds"]}
 
     def update_weights_from_ipc(
         self,

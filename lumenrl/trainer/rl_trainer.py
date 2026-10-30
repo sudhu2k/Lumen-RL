@@ -527,8 +527,7 @@ class RLTrainer:
                 group_name=group_name,
             )
         elif weight_backend == "mori":
-            if vcfg.quantization or self.config.weight_sync.resolve_fp8_quantize():
-                raise ValueError("weight_sync.backend=mori supports BF16 rollout only")
+            # vLLM's quantization and dtype were checked when the plan was resolved.
             self._init_mori_weight_sync(mgr)
         logger.info(
             "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s, weight_sync=%s).",
@@ -1134,6 +1133,9 @@ class RLTrainer:
         )
         if not check:
             return
+        if self._mori_plan.meta.get("staged_checkpoint"):
+            self._mori_checkpoint_startup_check(mgr, readers)
+            return
         src = self._actor_wg.execute_all_sync("prepare_mori_weight_source", verify=True)
         bad = [
             f"rollout rank {d}: {b}"
@@ -1153,7 +1155,34 @@ class RLTrainer:
             "(%.3fs)", max(float(r["seconds"]) for r in rows),
         )
 
-    def _run_mori_sync(self, mgr, *, version: int, verify: bool, src=None):
+    def _mori_checkpoint_startup_check(self, mgr, readers: list) -> None:
+        """Startup check for a plan into checkpoint tensors (online-quantized vLLM).
+
+        The staging is transient, so there is nothing to hash before a sync. Instead one
+        sync with verification must read exactly the trainer's bytes, and leave every
+        vLLM parameter (quantized weights and scales) bitwise as vLLM's own load did.
+        """
+        rows, bad, _ = self._run_mori_sync(mgr, version=0, verify=True, digest=True)
+        if bad:
+            raise RuntimeError(f"MORI startup check: staged reads differ from the trainer: "
+                               f"{bad[:5]}")
+        changed = []
+        for d, (before, row) in enumerate(zip(readers, rows)):
+            after = row.pop("digest")
+            changed += [f"rollout rank {d}: {n}" for n in sorted(set(before["digest"]) | set(after))
+                        if before["digest"].get(n) != after.get(n)]
+        if changed:
+            raise RuntimeError(
+                f"MORI startup check: {len(changed)} vLLM parameters differ after one sync "
+                f"from vLLM's own load of the checkpoint: {changed[:5]}")
+        logger.info(
+            "MORI startup check passed: staged reads match the trainer and every vLLM "
+            "parameter is bitwise unchanged after one sync (%.3fs, of which load and "
+            "quantize %.3fs)", max(float(r["seconds"]) for r in rows),
+            max(float(r["load_s"]) + float(r["finalize_s"]) for r in rows),
+        )
+
+    def _run_mori_sync(self, mgr, *, version: int, verify: bool, src=None, digest: bool = False):
         """One MORI sync; returns the replicas' stats, mismatching reads, and wall time."""
         import ray
 
@@ -1163,7 +1192,7 @@ class RLTrainer:
         src = src if src is not None else prepared
         t0 = time.perf_counter()
         results = ray.get(
-            mgr.start_receive_weights_mori(version=version, verify=verify),
+            mgr.start_receive_weights_mori(version=version, verify=verify, digest=digest),
             timeout=float(self.config.weight_sync.timeout_s),
         )
         read_s = time.perf_counter() - t0
@@ -1210,7 +1239,19 @@ class RLTrainer:
             )
         permuted = max(int(r.get("permuted", 0)) for r in rows)
         staged = ""
-        if permuted:
+        if "load_s" in rows[0]:
+            # Checkpoint staging: vLLM's load_weights and the FP8 finalize, per rank.
+            load_s = max(float(r["load_s"]) for r in rows)
+            finalize_s = max(float(r["finalize_s"]) for r in rows)
+            wait_s = max(float(r["read_wait_s"]) for r in rows)
+            self._last_weight_sync_metrics.update({
+                "timing/weight_sync_mori_load_s": load_s,
+                "timing/weight_sync_mori_finalize_s": finalize_s,
+                "timing/weight_sync_mori_read_wait_s": wait_s,
+            })
+            staged = (f" (vLLM load_weights {load_s:.3f}s, finalize {finalize_s:.3f}s, "
+                      f"waiting on reads {wait_s:.3f}s)")
+        elif permuted:
             # Time after the direct rounds: the permuted tensors' reads and view copies.
             staged_s = max(float(r["seconds"]) - float(r["direct_s"]) for r in rows)
             self._last_weight_sync_metrics["timing/weight_sync_mori_staged_s"] = staged_s
