@@ -37,7 +37,13 @@ from typing import Optional
 import torch
 
 from lumenrl.transfer.weight_plan import apply_plan, correspond, merge_plans, plan_rounds
-from lumenrl.transfer.weight_source_map import CheckpointIndex, SourceMap, apply_view, capture
+from lumenrl.transfer.weight_source_map import (
+    CheckpointIndex,
+    SourceMap,
+    apply_view,
+    capture,
+    checkpoint_map,
+)
 
 _T0 = time.time()
 
@@ -417,14 +423,20 @@ def checkpoint_dtype(model_dir: str) -> Optional[str]:
     return None
 
 
+# vLLM quantizations that quantize the BF16 checkpoint as it loads, through the same
+# loaders as BF16: plans for them read into checkpoint tensors (design 2.4).
+ONLINE_QUANTIZATION = frozenset({"fp8_per_block"})
+
+
 def check_engine_args(engine_kwargs: dict, model_dir: str) -> None:
-    """Reject vLLM settings the maps can't serve: the plan copies BF16 bytes into vLLM's
-    parameters as loaded, so they must be BF16 and unquantized (computed parameters,
-    design 2.4, are not implemented)."""
-    if engine_kwargs.get("quantization"):
+    """Reject vLLM settings the maps can't serve: the plan copies BF16 bytes, into
+    vLLM's parameters as loaded or, for online quantization, into checkpoint tensors
+    vLLM loads itself; other quantizations (computed parameters) are not implemented."""
+    q = engine_kwargs.get("quantization")
+    if q and q not in ONLINE_QUANTIZATION:
         raise NotImplementedError(
-            f"MORI weight sync copies BF16 weights; vLLM quantization="
-            f"{engine_kwargs['quantization']!r} is not supported yet")
+            f"MORI weight sync copies BF16 weights; vLLM quantization={q!r} is not "
+            f"supported (online: {sorted(ONLINE_QUANTIZATION)})")
     dtype = str(engine_kwargs.get("dtype") or "auto")
     if dtype == "auto":
         dtype = checkpoint_dtype(model_dir) or "unknown"
@@ -481,6 +493,80 @@ def cache_key(index: CheckpointIndex, model_dir: str, trainer: dict, vllm: dict,
     return hashlib.sha1(blob.encode()).hexdigest()[:16]
 
 
+def verify_plan(plan, src: dict, ranks: Optional["VllmRanks"], single: Optional[dict],
+                world: int) -> dict:
+    """Execute every rollout rank's reads locally from the trainers' real tensors; each
+    parameter must equal what vLLM's own loader put there (``single`` for one rank,
+    else ``ranks``' real dumps), permuted ones after their view."""
+    res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": [], "not_planned": [],
+           "views": 0, "views_equal": 0}
+    dst_col = plan.col("dst_rank")
+    for d in range(int(plan.meta["n_dst"])):
+        ref = single if ranks is None else ranks.real_params(d % world)
+        mine = [plan.dst_names[q] for q in sorted(set(plan.col("dst_param")[dst_col == d].tolist()))]
+        got = {n: torch.zeros_like(ref[n]) for n in mine}
+        written = apply_plan(plan, d, src, got)
+        for n in mine:
+            res["params"] += 1
+            view = plan.meta["views"].get(n)
+            if view is not None:
+                res["views"] += 1
+                got[n] = apply_view(view, got[n].view(-1), torch.empty_like(got[n]))
+            if torch.equal(got[n], ref[n]):
+                res["views_equal"] += view is not None
+                res["equal"] += 1
+            else:
+                res["mismatch"].append((d, n))
+            if written.get(n, 0) != ref[n].numel() * ref[n].element_size():
+                res["coverage_short"].append((d, n, written.get(n, 0)))
+        res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(mine)))
+        del got, ref
+    res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
+    return res
+
+
+def verify_checkpoint_plan(plan, src: dict, groups: list[dict], world: int,
+                           model_dir: str) -> dict:
+    """For a plan into checkpoint tensors: each rollout rank's reads, executed locally
+    from the trainers' real tensors, must reproduce the real checkpoint on exactly the
+    elements that rank's loader reads (``g["ckpt"]``) and write nothing else."""
+    from safetensors import safe_open
+
+    group_of = {r: g for g in groups for r in g["ranks"]}
+    names = set(plan.dst_names)
+    real: dict[str, torch.Tensor] = {}
+    for f in sorted(x for x in os.listdir(model_dir) if x.endswith(".safetensors")):
+        with safe_open(os.path.join(model_dir, f), framework="pt") as fh:
+            for n in fh.keys():
+                if n in names:
+                    real[n] = fh.get_tensor(n)
+    res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": []}
+    dst_col = plan.col("dst_rank")
+    for d in range(int(plan.meta["n_dst"])):
+        ckpt = group_of[d % world]["ckpt"]
+        mine = [plan.dst_names[q] for q in sorted(set(plan.col("dst_param")[dst_col == d].tolist()))]
+        got = {n: torch.zeros_like(real[n]) for n in mine}
+        written = apply_plan(plan, d, src, got)
+        for n in mine:
+            res["params"] += 1
+            want = real[n].view(-1)
+            read = ckpt.params[n].runs.expand(want.numel()) >= 0
+            esize = want.element_size()
+            # Compare bytes, so a NaN in the checkpoint equals itself.
+            mask = read.repeat_interleave(esize)
+            wb = want.view(torch.uint8)
+            if torch.equal(got[n].view(-1).view(torch.uint8),
+                           torch.where(mask, wb, torch.zeros_like(wb))):
+                res["equal"] += 1
+            else:
+                res["mismatch"].append((d, n))
+            if written.get(n, 0) != int(read.sum()) * esize:
+                res["coverage_short"].append((d, n, written.get(n, 0)))
+        del got
+    res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
+    return res
+
+
 def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str) -> None:
     """Maps, plan (``out/plan.pt``) and ``out/report.json``; with ``--verify`` also the
     bitwise check against both engines' own loading."""
@@ -535,16 +621,29 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
         ranks = None
     world = ranks.world if ranks is not None else 1
 
+    online = bool(args.vllm_quantization)
     plans = []
     t0 = time.time()
     for g in groups:
-        classes = g["classes"]
-        views = g["map"].meta.get("permutations", {})
-        # Permuted parameters are read in their loader-stage layout (the map is the
-        # loader stage's) and moved into place by their view on the rollout GPU.
-        synced = sorted(n for n, c in classes.items()
-                        if c in ("identity", "permutation") and g["map"].params[n].valid)
-        copies = correspond(tmaps["loader"], g["map"], synced)
+        if online:
+            # Destinations are the checkpoint elements the rank's loader reads; vLLM
+            # loads and quantizes them itself each sync.
+            g["ckpt"] = checkpoint_map(g["map"], index)
+            synced = sorted(g["ckpt"].params)
+            classes, views = {n: "identity" for n in synced}, {}
+            copies = correspond(tmaps["loader"], g["ckpt"], synced)
+            short = copies.report["missing_elements"]
+            if short:
+                raise RuntimeError(f"the trainer holds no source for {len(short)} checkpoint "
+                                   f"tensors vLLM reads, e.g. {sorted(short)[:5]}")
+        else:
+            classes = g["classes"]
+            views = g["map"].meta.get("permutations", {})
+            # Permuted parameters are read in their loader-stage layout (the map is the
+            # loader stage's) and moved into place by their view on the rollout GPU.
+            synced = sorted(n for n, c in classes.items()
+                            if c in ("identity", "permutation") and g["map"].params[n].valid)
+            copies = correspond(tmaps["loader"], g["map"], synced)
         if copies.report["overlapping_src_runs"]:
             raise RuntimeError(f"{copies.report['overlapping_src_runs']} trainer runs overlap")
         plan = plan_rounds(copies, args.n_trainer, len(g["ranks"]) * args.n_vllm,
@@ -566,6 +665,12 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
                                   "permutations": view_summary(g["map"])}
                                  for (p, c), g in zip(plans, groups)]}
     plan.meta["key"] = key
+    if online:
+        dst = set(plan.dst_names)
+        plan.meta["quantization"] = args.vllm_quantization
+        plan.meta["staged_checkpoint"] = {
+            t.name: {"shape": list(t.shape), "dtype": t.dtype_name}
+            for t in index.tensors if t.name in dst}
     plan.save(os.path.join(out, "plan.pt"))
     log(f"plan.pt: {plan.meta['n_dst']} rollout ranks ({args.n_vllm} x {world}), "
         f"{plan.meta['traffic']['transport_reads']} transport reads; key {key}")
@@ -579,41 +684,21 @@ def build(args, engine_config: dict, index: CheckpointIndex, key: str, out: str)
         gc.collect()
         t0 = time.time()
         src = trainer.real_states()
-        if ranks is not None:
-            ranks._run(real=True)
+        if online:
+            res = verify_checkpoint_plan(plan, src, groups, world, args.model)
+            log(f"verify: {res['equal']}/{res['params']} checkpoint tensors equal where vLLM "
+                f"reads them")
         else:
-            _, single = vm.load(vm.real_weights(), keep_loader_stage=False)
-        res = {"params": 0, "equal": 0, "mismatch": [], "coverage_short": [], "not_planned": [],
-               "views": 0, "views_equal": 0}
-        dst_col = plan.col("dst_rank")
-        for d in range(int(plan.meta["n_dst"])):
-            r = d % world
-            ref = single if ranks is None else ranks.real_params(r)
-            mine = [plan.dst_names[q] for q in sorted(set(plan.col("dst_param")[dst_col == d].tolist()))]
-            got = {n: torch.zeros_like(ref[n]) for n in mine}
-            written = apply_plan(plan, d, src, got)
-            for n in mine:
-                res["params"] += 1
-                view = plan.meta["views"].get(n)
-                if view is not None:
-                    res["views"] += 1
-                    got[n] = apply_view(view, got[n].view(-1), torch.empty_like(got[n]))
-                if torch.equal(got[n], ref[n]):
-                    res["views_equal"] += view is not None
-                    res["equal"] += 1
-                else:
-                    res["mismatch"].append((d, n))
-                if written.get(n, 0) != ref[n].numel() * ref[n].element_size():
-                    res["coverage_short"].append((d, n, written.get(n, 0)))
-            res["not_planned"] = sorted(set(res["not_planned"]) | (set(ref) - set(mine)))
-            del got
             if ranks is not None:
-                del ref
-        res["mismatch"], res["coverage_short"] = res["mismatch"][:20], res["coverage_short"][:20]
+                ranks._run(real=True)
+                single = None
+            else:
+                _, single = vm.load(vm.real_weights(), keep_loader_stage=False)
+            res = verify_plan(plan, src, ranks, single, world)
+            log(f"verify: {res['equal']}/{res['params']} equal, not planned "
+                f"{res['not_planned']}; views {res['views_equal']}/{res['views']} equal")
         res["verify_s"] = round(time.time() - t0, 1)
         report["verify"] = res
-        log(f"verify: {res['equal']}/{res['params']} equal, not planned {res['not_planned']}; "
-            f"views {res['views_equal']}/{res['views']} equal")
 
     report["total_s"] = round(time.time() - _T0, 1)
     with open(os.path.join(out, "report.json"), "w") as f:
@@ -676,6 +761,8 @@ def main() -> None:
         vllm_kwargs = vllm_engine_kwargs(cfg)
     check_engine_args(vllm_kwargs, args.model)
     parallel, args.vllm_engine_args = split_vllm_args(vllm_kwargs)
+    # Online quantization loads through the BF16 loaders: maps come from the BF16 model.
+    args.vllm_quantization = args.vllm_engine_args.pop("quantization", None)
     for name in ("tp", "pp", "dp", "pcp", "dcp"):
         setattr(args, f"vllm_{name}", int(parallel.get(name, 1)))
     args.vllm_ep = bool(parallel.get("expert_parallel", False))
@@ -688,13 +775,16 @@ def main() -> None:
         args.n_vllm = rollout // world if args.n_vllm is None else args.n_vllm
     log(f"layout: {args.n_trainer} trainer ranks; {args.n_vllm} vLLM replicas of "
         f"TP={args.vllm_tp} PP={args.vllm_pp} DP={args.vllm_dp} PCP={args.vllm_pcp} "
-        f"DCP={args.vllm_dcp} EP={args.vllm_ep}; vLLM engine args {args.vllm_engine_args}")
+        f"DCP={args.vllm_dcp} EP={args.vllm_ep}; vLLM engine args {args.vllm_engine_args}"
+        + (f", online quantization {args.vllm_quantization}" if args.vllm_quantization else ""))
     index = CheckpointIndex.from_dir(args.model)
     plan_params = {"n_vllm": args.n_vllm, "round_mb": args.round_mb,
                    "max_piece_mb": args.max_piece_mb, "interleave": args.interleave}
+    quant = {"quantization": args.vllm_quantization} if args.vllm_quantization else {}
     key = cache_key(index, args.model, trainer_key(engine_config, args.n_trainer),
                     vllm_key(args.vllm_tp, args.vllm_pp, args.vllm_dp, args.vllm_pcp,
-                             args.vllm_dcp, args.vllm_ep, args.vllm_engine_args), plan_params)
+                             args.vllm_dcp, args.vllm_ep, {**args.vllm_engine_args, **quant}),
+                    plan_params)
 
     cached = False
     if args.out:

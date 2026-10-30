@@ -39,6 +39,7 @@ __all__ = [
     "SourceMap",
     "apply_view",
     "capture",
+    "checkpoint_map",
     "factor_view",
     "merge_rectangles",
     "permutation_of",
@@ -61,6 +62,11 @@ class CheckpointTensor:
     dtype: str
     start: int
     numel: int
+
+    @property
+    def dtype_name(self) -> str:
+        """The torch dtype's name (``bfloat16``), as maps record dtypes."""
+        return str(_ST_DTYPES[self.dtype]).removeprefix("torch.")
 
 
 class CheckpointIndex:
@@ -392,6 +398,73 @@ def merge_rectangles(runs: Runs) -> Runs:
     return Runs(t["po"], t["co"], torch.stack([t["rows"], t["len"]], 1),
                 torch.stack([t["ps"], torch.ones_like(t["ps"])], 1),
                 torch.stack([t["cs"], t["st"]], 1))
+
+
+def _intervals(p: ParamMap) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[start, end)`` id ranges a parameter holds (unmerged, possibly overlapping)."""
+    r = p.runs.as_lines() if p.runs is not None else None
+    if r is not None and bool(((r.ckpt_strides[:, 0] == 1) | (r.length == 1)).all()):
+        return r.ckpt_offset, r.ckpt_offset + r.length
+    ids = p.ids()
+    ids = torch.unique(ids[ids >= 0])
+    if ids.numel() == 0:
+        return ids, ids
+    cut = torch.nonzero(ids[1:] != ids[:-1] + 1).squeeze(1)
+    first = torch.cat([torch.zeros(1, dtype=torch.int64), cut + 1])
+    last = torch.cat([cut, torch.tensor([ids.numel() - 1])])
+    return ids[first], ids[last] + 1
+
+
+def checkpoint_map(m: SourceMap, index: CheckpointIndex) -> SourceMap:
+    """The checkpoint elements ``m``'s parameters were loaded from, as a map onto the
+    checkpoint tensors themselves (element ``j`` of tensor ``t`` is id ``t.start + j``).
+
+    For an engine fed checkpoint tensors through its own loader each sync (online
+    quantization, design 2.4): these are the elements its loader reads, one entry per
+    tensor it reads any of. Elements of a tensor it never reads are left out.
+    """
+    bad = sorted(n for n, p in m.params.items() if not p.valid)
+    if bad:
+        raise ValueError(f"{len(bad)} parameters have no map, e.g. {bad[:5]}")
+    parts = [_intervals(p) for p in m.params.values()]
+    a = torch.cat([x for x, _ in parts]) if parts else torch.zeros(0, dtype=torch.int64)
+    b = torch.cat([y for _, y in parts]) if parts else a
+    order = torch.argsort(a)
+    a, b = a[order], b[order]
+    params: dict[str, ParamMap] = {}
+    if a.numel():
+        reach = torch.cummax(b, 0).values
+        new = torch.ones_like(a, dtype=torch.bool)
+        new[1:] = a[1:] > reach[:-1]
+        group = torch.cumsum(new.to(torch.int64), 0) - 1
+        lo = a[new]
+        hi = torch.zeros_like(lo).scatter_reduce(0, group, b, "amax", include_self=False)
+        starts = torch.tensor([t.start for t in index.tensors], dtype=torch.int64)
+        t_lo = torch.searchsorted(starts, lo, right=True) - 1
+        t_hi = torch.searchsorted(starts, hi - 1, right=True) - 1
+        one = t_lo == t_hi
+        xs, ys, ks = [lo[one]], [hi[one]], [t_lo[one]]
+        cross = torch.nonzero(~one).squeeze(1).tolist()
+        if cross:
+            split = []
+            for x, y, i, j in zip(lo[cross].tolist(), hi[cross].tolist(),
+                                  t_lo[cross].tolist(), t_hi[cross].tolist()):
+                for k in range(i, j + 1):
+                    t = index.tensors[k]
+                    split.append((max(x, t.start), min(y, t.start + t.numel), k))
+            s = torch.tensor(split, dtype=torch.int64)
+            xs.append(s[:, 0]), ys.append(s[:, 1]), ks.append(s[:, 2])
+        x, y, k = torch.cat(xs), torch.cat(ys), torch.cat(ks)
+        order = torch.argsort(x)
+        x, y, k = x[order], y[order], k[order]
+        tensors, counts = torch.unique_consecutive(k, return_counts=True)
+        for ti, xi, yi in zip(tensors.tolist(), x.split(counts.tolist()), y.split(counts.tolist())):
+            t = index.tensors[ti]
+            n = yi - xi
+            runs = Runs.lines(xi - t.start, n, xi, torch.ones_like(n))
+            params[t.name] = ParamMap(t.name, t.shape, t.dtype_name, runs)
+    meta = {k: m.meta[k] for k in ("checkpoint", "elements", "passes") if k in m.meta}
+    return SourceMap(params, {**meta, "stage": "checkpoint"})
 
 
 def permutation_of(loader: torch.Tensor, final: torch.Tensor) -> Optional[torch.Tensor]:

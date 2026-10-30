@@ -5,7 +5,13 @@ import torch
 
 from lumenrl.engine.training.bridges.gpt import GPTDims, hf_to_megatron
 from lumenrl.transfer.weight_plan import apply_plan, correspond, plan_rounds
-from lumenrl.transfer.weight_source_map import CheckpointIndex, CheckpointTensor, capture
+from lumenrl.transfer.weight_source_map import (
+    CheckpointIndex,
+    CheckpointTensor,
+    ParamMap,
+    capture,
+    checkpoint_map,
+)
 
 D = GPTDims(num_layers=2, hidden=8, num_heads=4, num_kv_groups=2, head_dim=2, ffn=6, vocab=40)
 VOCAB_PAD = 48
@@ -164,3 +170,50 @@ def test_plan_reproduces_rollout_layout_from_trainer_layout(tp_rank):
             else:
                 assert torch.equal(got[n], t), n
                 assert written[n] == t.numel() * 2, n
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_checkpoint_map_is_what_the_loader_reads(tp_rank):
+    """Online quantization: the plan reads into checkpoint tensors, exactly the elements
+    the rollout rank's loader takes (half of o_proj here; not lm_head, which it drops;
+    a raw-id parameter too)."""
+    index = _index((1 << 33) + 5)
+    down = "model.layers.1.mlp.down_proj.weight"
+    shuffle = torch.randperm(D.hidden * D.ffn, generator=torch.Generator().manual_seed(1))
+
+    def rollout(hf):
+        out = _rollout(hf, tp_rank=tp_rank, tp=2)
+        del out["lm_head.weight"]
+        return out
+
+    tmap, _ = capture(index, lambda k: {"loader": _trainer(index.id_state(k))}, log=lambda s: None)
+    vmap, _ = capture(index, lambda k: {"loader": rollout(index.id_state(k))}, log=lambda s: None)
+    m = vmap["loader"]
+    p = m.params[down]
+    m.params[down] = ParamMap(down, p.shape, p.dtype, raw=p.ids().view(-1)[shuffle])
+    ckpt = checkpoint_map(m, index)
+
+    truth = _truth(index, rollout)
+    read = torch.unique(torch.cat([t.reshape(-1) for t in truth.values()]))
+    assert set(ckpt.params) == {t.name for t in index.tensors} - {"lm_head.weight"}
+    for t in index.tensors:
+        if t.name not in ckpt.params:
+            continue
+        ids = torch.arange(t.start, t.start + t.numel)
+        want = torch.where(torch.isin(ids, read), ids, torch.full_like(ids, -1))
+        assert torch.equal(ckpt.params[t.name].runs.expand(t.numel), want), t.name
+    o = ckpt.params["model.layers.0.self_attn.o_proj.weight"].runs
+    assert len(o) == D.hidden and bool((o.length == D.num_heads * D.head_dim // 2).all())
+
+    copies = correspond(tmap["loader"], ckpt)
+    assert not copies.report["missing_elements"]
+    plan = plan_rounds(copies, n_src=2, n_dst=1, round_bytes=1024, max_piece_bytes=256)
+    torch.manual_seed(0)
+    hf = {t.name: torch.randn(t.shape).to(torch.bfloat16) for t in index.tensors}
+    got = {n: torch.zeros_like(hf[n]) for n in ckpt.params}
+    written = apply_plan(plan, 0, {s: _trainer(hf) for s in range(2)}, got)
+    for t in index.tensors:
+        if t.name in got:
+            mask = (ckpt.params[t.name].runs.expand(t.numel) >= 0).view(t.shape)
+            assert torch.equal(got[t.name], torch.where(mask, hf[t.name], 0)), t.name
+            assert written[t.name] == int(mask.sum()) * 2
