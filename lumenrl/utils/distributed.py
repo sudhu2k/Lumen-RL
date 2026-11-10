@@ -12,6 +12,18 @@ from torch import Tensor
 logger = logging.getLogger(__name__)
 
 
+def missing_rdma_hcas(hca: str) -> list[str]:
+    """Devices named by ``hca`` (``NCCL_IB_HCA`` syntax: ``a,b:1``, ``=a`` for exact
+    names, ``^a`` for an exclude list) that this host does not have."""
+    from pathlib import Path
+
+    spec = str(hca).strip()
+    if spec.startswith("^"):
+        return []
+    names = [n.strip().split(":")[0] for n in spec.lstrip("=").split(",") if n.strip()]
+    return [n for n in names if not (Path("/sys/class/infiniband") / n).exists()]
+
+
 def get_rank() -> int:
     """Return the distributed rank, or ``0`` if not initialized."""
     if not dist.is_available() or not dist.is_initialized():

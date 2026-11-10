@@ -52,6 +52,20 @@ def _placement_node_ips(
     return [node_ip] * group_count
 
 
+class _GpuProbe:
+    """Reports the GPU Ray bound to its placement-group bundle."""
+
+    def gpu(self) -> int:
+        ids = ray.get_gpu_ids()
+        return int(float(str(ids[0]))) if ids else -1
+
+
+def _bundle_order(gpu_ids: list[int]) -> list[int]:
+    """Bundle indices by the GPU each is bound to (unknown last), so local rank ``i``
+    runs on the node's ``i``-th GPU in device order."""
+    return sorted(range(len(gpu_ids)), key=lambda i: (gpu_ids[i] < 0, gpu_ids[i], i))
+
+
 class RayWorkerGroup:
     """A group of Ray actor workers for a single RL role.
 
@@ -153,7 +167,8 @@ class RayWorkerGroup:
         """verl-style start: create per-node placement groups with STRICT_PACK.
 
         One placement group per ``process_on_nodes`` entry, filled with
-        consecutive ranks, so rank -> node is deterministic. A TP>1 rollout
+        consecutive ranks in the node's GPU order, so rank -> node and rank -> GPU
+        are deterministic. A TP>1 rollout
         depends on that: ``VLLMReplicaManager.create`` requires ranks
         ``i*tp .. i*tp+tp-1`` to share a node and raises "replica i spans N
         nodes" otherwise.
@@ -197,10 +212,11 @@ class RayWorkerGroup:
             [(pg.bundle_count, count) for pg, count in pgs],
             [node_ip or "auto" for node_ip in pinned_node_ips],
         )
+        orders = [self._bundle_orders(pg, count, gpus_per_worker) for pg, count in pgs]
 
         RemoteWorker = ray.remote(self.worker_cls)
         rank = 0
-        for pg, count in pgs:
+        for (pg, count), order in zip(pgs, orders):
             for local_rank in range(count):
                 actor_name = f"{self.pool.name}:{self.worker_cls.__name__}:{rank}"
                 options_kwargs: dict[str, Any] = {
@@ -208,7 +224,7 @@ class RayWorkerGroup:
                     "num_cpus": 1,
                     "scheduling_strategy": PlacementGroupSchedulingStrategy(
                         placement_group=pg,
-                        placement_group_bundle_index=local_rank,
+                        placement_group_bundle_index=order[local_rank],
                     ),
                 }
                 if self.detached:
@@ -223,6 +239,28 @@ class RayWorkerGroup:
                 if self.detached:
                     self._worker_names.append(actor_name)
                 rank += 1
+
+    def _bundle_orders(self, pg, count: int, gpus_per_worker: float) -> list[int]:
+        """Bundle index for each local rank of ``pg``: Ray binds bundles to GPUs in
+        no particular order, and MORI picks NICs by device position, so ranks follow
+        the GPUs' device order (``_bundle_order``)."""
+        if gpus_per_worker <= 0:
+            return list(range(count))
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        probe = ray.remote(_GpuProbe)
+        probes = [probe.options(
+            num_gpus=gpus_per_worker, num_cpus=0,
+            scheduling_strategy=PlacementGroupSchedulingStrategy(
+                placement_group=pg, placement_group_bundle_index=i),
+        ).remote() for i in range(count)]
+        gpu_ids = ray.get([p.gpu.remote() for p in probes])
+        for p in probes:
+            ray.kill(p)
+        order = _bundle_order(gpu_ids)
+        logger.info("Pool '%s': bundles bound to GPUs %s; local ranks 0..%d on GPUs %s",
+                    self.pool.name, gpu_ids, count - 1, [gpu_ids[i] for i in order])
+        return order
 
     def stop(self) -> None:
         """Stop all workers."""

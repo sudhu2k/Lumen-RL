@@ -42,11 +42,22 @@ __all__ = [
     "checkpoint_map",
     "factor_view",
     "merge_rectangles",
+    "mori_source_tensors",
     "permutation_of",
     "unapply_view",
 ]
 
 _ST_DTYPES = {"BF16": torch.bfloat16, "F16": torch.float16, "F32": torch.float32}
+
+
+def mori_source_tensors(model):
+    """The trainer tensors MORI reads: every parameter, plus the noaux_tc router bias
+    (DeepSeek-V3 family), a persistent fp32 buffer that Megatron updates in place and
+    the rollout's top-k reads."""
+    yield from model.named_parameters()
+    for name, buf in model.named_buffers():
+        if name.endswith("mlp.router.expert_bias"):
+            yield name, buf
 
 # Above this many runs a parameter is kept raw: a run per few elements costs more
 # than the int64 ids themselves, and only permutations get there.

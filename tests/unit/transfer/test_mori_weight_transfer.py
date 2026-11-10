@@ -102,3 +102,6 @@ def test_source_export_wire_round_trip():
     w = e.to_wire()
     assert all(isinstance(x, list) for x in w["params"])
     assert SourceExport.from_wire(w) == e
+    r = SourceExport(3, b"eng", [b"m0"], {7: (0, 0, 64)}, b"rdma", [b"r0"], host="T", rail=2)
+    assert SourceExport.from_wire(r.to_wire()) == r
+    assert r.over_rdma() == SourceExport(3, b"rdma", [b"r0"], {7: (0, 0, 64)}, host="T", rail=2)

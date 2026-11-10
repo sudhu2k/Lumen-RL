@@ -319,34 +319,25 @@ def test_dsv3_uses_the_stock_te_layer_spec():
 
 # --- unsupported variants and dropped engine_config knobs -------------------
 
-def test_a_missing_q_lora_rank_is_refused_not_coerced_to_zero():
-    """Megatron branches on ``q_lora_rank is None``, so ``or 0`` is not a no-op.
-
-    Coercing takes the LoRA branch and builds a rank-0 projection; separately
-    the bridge has no ``linear_q_proj`` mapping, so the non-LoRA q projection
-    would be dropped from the weight sync silently. Both are quiet failures.
-    """
+def test_a_missing_q_lora_rank_stays_none_not_zero():
+    """Megatron branches on ``q_lora_rank is None``, so ``or 0`` is not a no-op:
+    coercing takes the LoRA branch and builds a rank-0 projection."""
     no_lora = {k: v for k, v in K2.items() if k != "q_lora_rank"}
-    with pytest.raises(ValueError, match="q_lora_rank"):
-        dsv3.build_dsv3_config(no_lora, {})
+    assert dsv3.build_dsv3_config(no_lora, {}).q_lora_rank is None
 
 
-def test_an_explicit_null_q_lora_rank_is_refused_too():
-    # DeepSeek-V2-Lite ships `"q_lora_rank": null`, so this is the real spelling.
-    with pytest.raises(ValueError, match="q_lora_rank"):
-        dsv3.build_dsv3_config({**K2, "q_lora_rank": None}, {})
+def test_an_explicit_null_q_lora_rank_is_full_rank():
+    # DeepSeek-V2-Lite and Moonlight ship `"q_lora_rank": null`.
+    assert dsv3.build_dsv3_config({**K2, "q_lora_rank": None}, {}).q_lora_rank is None
+    assert dsv3.build_dsv3_dims({**K2, "q_lora_rank": None}).q_lora_rank is None
 
 
 def test_a_zero_q_lora_rank_is_refused():
     # 0 is not None, so Megatron would take the LoRA branch at rank 0.
     with pytest.raises(ValueError, match="q_lora_rank"):
         dsv3.build_dsv3_config({**K2, "q_lora_rank": 0}, {})
-
-
-def test_the_dims_builder_refuses_it_as_well():
-    """``build_dims`` is its own spec hook, reachable without ``build_config``."""
     with pytest.raises(ValueError, match="q_lora_rank"):
-        dsv3.build_dsv3_dims({**K2, "q_lora_rank": None})
+        dsv3.build_dsv3_dims({**K2, "q_lora_rank": 0})
 
 
 def test_a_real_q_lora_rank_still_passes_through():

@@ -515,6 +515,7 @@ class RLTrainer:
             start_http=bool(vcfg.ray_http_start_server),
             max_concurrency=max(8, int(vcfg.max_num_seqs)),
             base_seed=(int(seed) if seed is not None else None),
+            gpu_order_wg=self._actor_wg if colocation_wg is not self._actor_wg else None,
         )
         mgr.create()
         self._ray_rollout_mgr = mgr
@@ -1149,7 +1150,7 @@ class RLTrainer:
         plan_path = self._mori_plan_path
         check = bool(cfg.startup_check) and int(getattr(self, "_resume_step", 0) or 0) == 0
         t0 = time.perf_counter()
-        _, readers = mgr.init_mori_weight_sync(
+        exports, readers = mgr.init_mori_weight_sync(
             self._actor_wg, plan_path=plan_path, window=int(cfg.window),
             num_streams=int(cfg.num_streams), strided=bool(cfg.strided), hash_before=check,
         )
@@ -1162,6 +1163,17 @@ class RLTrainer:
             max(float(r["bytes"]) for r in readers) / 1e9,
             "on" if all(r.get("strided") for r in readers) else "off",
         )
+        if any("nic" in r for r in readers):
+            moved = [f"rank {d} ({r.get('gpu_bus', '?')} via {r['nic']}, own {r['own_nic']})"
+                     for d, r in enumerate(readers) if r.get("nic") != r.get("own_nic")]
+            net = sum(float(r.get("net_bytes", 0.0)) for r in readers)
+            local = sum(float(r.get("rail_local_bytes", 0.0)) for r in readers)
+            logger.info(
+                "MORI rails: %d of %d rollout ranks read through a NIC other than their GPU's "
+                "own%s; %.1f of %.1f GB come from trainer GPUs whose own NIC is on the "
+                "reader's rail", len(moved), len(readers),
+                f" ({', '.join(moved)})" if moved else "", local / 1e9, net / 1e9,
+            )
         if not check:
             return
         if self._mori_plan.meta.get("staged_checkpoint"):
@@ -1236,7 +1248,8 @@ class RLTrainer:
         return rows, bad, read_s
 
     def _sync_weights_mori(self, mgr) -> None:
-        """Rollout replicas pull the plan's regions from the trainers over MORI XGMI."""
+        """Rollout replicas pull the plan's regions from the trainers over MORI: XGMI on
+        one node; from another node, on-rail RDMA once per node, then XGMI."""
         if self._actor_wg is None:
             return
         rollout_engine = self._ray_vllm_engine
@@ -1274,7 +1287,7 @@ class RLTrainer:
             # Checkpoint staging: vLLM's load_weights and the FP8 finalize, per rank.
             load_s = max(float(r["load_s"]) for r in rows)
             finalize_s = max(float(r["finalize_s"]) for r in rows)
-            wait_s = max(float(r["read_wait_s"]) for r in rows)
+            wait_s = max(float(r.get("slot_wait_s", r["read_wait_s"])) for r in rows)
             self._last_weight_sync_metrics.update({
                 "timing/weight_sync_mori_load_s": load_s,
                 "timing/weight_sync_mori_finalize_s": finalize_s,
@@ -1282,6 +1295,33 @@ class RLTrainer:
             })
             staged = (f" (vLLM load_weights {load_s:.3f}s, finalize {finalize_s:.3f}s, "
                       f"waiting on reads {wait_s:.3f}s)")
+        if "out_bytes" in rows[0]:
+            # Cross-node, node plan: on-rail RDMA into mirrors once per node, then read
+            # from the mirrors over XGMI.
+            net_b = sum(float(r["net_bytes"]) for r in rows)
+            out_b = sum(float(r["out_bytes"]) for r in rows)
+            land_b = sum(float(r.get("land_bytes", 0.0)) for r in rows)
+            stage_b = sum(float(r.get("stage_bytes", 0.0)) for r in rows)
+            mirror_b = max(float(r.get("mirror_bytes", 0.0)) for r in rows)
+            gate_s = max(float(r["gate_wait_s"]) for r in rows)
+            secs = [float(r["seconds"]) for r in rows]
+            slow = secs.index(max(secs))
+            self._last_weight_sync_metrics.update({
+                "timing/weight_sync_mori_net_s": max(float(r["net_s"]) for r in rows),
+                "timing/weight_sync_mori_gate_wait_s": gate_s,
+                "weight_sync/net_bytes": net_b,
+                "weight_sync/in_place_bytes": land_b,
+                "weight_sync/stage_bytes": stage_b,
+                "weight_sync/mirror_bytes_max": mirror_b,
+                "weight_sync/xgmi_bytes": out_b,
+            })
+            staged += (f" (node plan: RDMA {net_b / 1e9:.1f}GB, {land_b / 1e9:.1f}GB of it into "
+                       f"the weights in place, {stage_b / 1e9:.1f}GB into staging slots, "
+                       f"mirrors up to {mirror_b / 1e9:.2f}GB per GPU; XGMI "
+                       f"{out_b / 1e9:.1f}GB "
+                       f"from other GPUs' mirrors, longest wait for mirrors {gate_s:.3f}s; "
+                       f"slowest rank {slow} {secs[slow]:.3f}s; per rank "
+                       f"{' '.join(f'{s:.3f}' for s in secs)})")
         elif permuted:
             # Time after the direct rounds: the permuted tensors' reads and view copies.
             staged_s = max(float(r["seconds"]) - float(r["direct_s"]) for r in rows)

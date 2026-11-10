@@ -933,11 +933,14 @@ class LumenActorWorker(BaseWorker):
     def rdma_preflight(self, interface: str, hca: str) -> dict[str, Any]:
         from pathlib import Path
 
+        from lumenrl.utils.distributed import missing_rdma_hcas
+
         uverbs = sorted(Path("/dev/infiniband").glob("uverbs*"))
-        hca_path = Path("/sys/class/infiniband") / hca
-        if not uverbs or not hca_path.exists():
+        missing = missing_rdma_hcas(hca)
+        if not uverbs or missing:
             raise RuntimeError(
-                f"RDMA unavailable in actor container: uverbs={uverbs}, hca={hca}"
+                f"RDMA unavailable in actor container: uverbs={uverbs}, hca={hca}, "
+                f"missing={missing}"
             )
         rendezvous = self.get_rdma_rendezvous(interface)
         return {

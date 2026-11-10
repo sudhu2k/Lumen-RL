@@ -65,7 +65,7 @@ class DSV3Dims(GPTDims):
     non-attention parts of a bridge stay reusable.
     """
 
-    q_lora_rank: int = 1536
+    q_lora_rank: Optional[int] = 1536
     kv_lora_rank: int = 512
     qk_nope_head_dim: int = 128
     qk_rope_head_dim: int = 64
@@ -76,24 +76,22 @@ class DSV3Dims(GPTDims):
     routed_scaling_factor: float = 1.0
 
 
-def _require_q_lora_rank(hf: Mapping[str, Any]) -> int:
-    """The q LoRA rank, refusing the variants this bridge cannot express.
+def _q_lora_rank(hf: Mapping[str, Any]) -> Optional[int]:
+    """The q LoRA rank, or None for a full-rank q projection (DeepSeek-V2-Lite,
+    Moonlight), which ship ``"q_lora_rank": null``.
 
     Megatron branches on ``q_lora_rank is None`` (``MLASelfAttention``; the
-    dataclass default is ``512``), so coercing a missing value to ``0`` takes
-    the LoRA branch and builds a rank-0 projection instead of the non-LoRA one.
-    Independently, ``_ATTN_MAP`` has no entry for ``linear_q_proj`` and
-    ``megatron_to_hf`` exports only names it has a rule for -- so that
-    variant's q projection would drop out of the weight sync with nothing but a
-    log warning. Both failures are quiet, which is why this refuses rather than
-    coerces.
+    dataclass default is ``512``), so a missing value must stay None: coercing
+    it to ``0`` takes the LoRA branch and builds a rank-0 projection. ``0`` in
+    the config is refused for the same reason.
     """
     q = hf.get("q_lora_rank")
-    if q is None or int(q) <= 0:
+    if q is None:
+        return None
+    if int(q) <= 0:
         raise ValueError(
             f"DSv3 with q_lora_rank={q!r} is not supported: Megatron branches on "
-            "`q_lora_rank is None`, so this would build a rank-0 q projection, "
-            "and the bridge has no mapping for `linear_q_proj`"
+            "`q_lora_rank is None`, so this would build a rank-0 q projection"
         )
     return int(q)
 
@@ -113,7 +111,7 @@ def build_dsv3_dims(hf: Mapping[str, Any]) -> DSV3Dims:
         num_experts=int(hf.get("n_routed_experts") or 0),
         moe_ffn=moe_ffn,
         shared_expert_ffn=moe_ffn * n_shared,
-        q_lora_rank=_require_q_lora_rank(hf),
+        q_lora_rank=_q_lora_rank(hf),
         kv_lora_rank=int(hf["kv_lora_rank"]),
         qk_nope_head_dim=int(hf["qk_nope_head_dim"]),
         qk_rope_head_dim=int(hf["qk_rope_head_dim"]),
@@ -301,7 +299,7 @@ def build_dsv3_config(
         variable_seq_lengths=(pp > 1),
         # --- MLA ---
         multi_latent_attention=True,
-        q_lora_rank=_require_q_lora_rank(hf),
+        q_lora_rank=_q_lora_rank(hf),
         kv_lora_rank=int(hf["kv_lora_rank"]),
         qk_head_dim=int(hf["qk_nope_head_dim"]),
         qk_pos_emb_head_dim=int(hf["qk_rope_head_dim"]),
@@ -334,6 +332,8 @@ def build_dsv3_config(
 # Megatron per-layer name -> HF per-layer name. Straight renames only; shared by
 # export (as rules) and load (inverted per layer type).
 _ATTN_MAP = {
+    # Full-rank q (q_lora_rank None) instead of the three LoRA entries below.
+    "self_attention.linear_q_proj.weight": "self_attn.q_proj.weight",
     "self_attention.linear_q_down_proj.weight": "self_attn.q_a_proj.weight",
     "self_attention.linear_q_up_proj.weight": "self_attn.q_b_proj.weight",
     "self_attention.linear_q_up_proj.layer_norm_weight": "self_attn.q_a_layernorm.weight",
@@ -379,12 +379,14 @@ def megatron_to_hf(named_params: Iterable[tuple[str, torch.Tensor]]) -> Iterator
     return DSV3.megatron_to_hf(named_params)
 
 
-def hf_to_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
+def hf_to_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True,
+                   routed_experts: bool = True):
     """Inverse of :func:`megatron_to_hf` at TP=PP=EP=1.
 
     Returns ``{megatron_name: tensor}``. Sharded topologies slice this the same
     way the Qwen3 path does; keeping the whole-model conversion separate from the
-    sharding keeps both testable.
+    sharding keeps both testable. ``routed_experts=False`` leaves the routed
+    experts out, for the engine's MoE loader, which takes each rank's own.
     """
     hf = {strip_module_prefix(k): v for k, v in hf_state.items()}
     meg: dict[str, torch.Tensor] = {}
@@ -430,7 +432,7 @@ def hf_to_megatron(hf_state, d: DSV3Dims, use_grouped_mlp: bool = True):
             if dn in hf:
                 meg[mp + "mlp.shared_experts.linear_fc2.weight"] = hf[dn]
 
-        for e in range(d.num_experts):
+        for e in range(d.num_experts if routed_experts else 0):
             ep_ = f"{hp}mlp.experts.{e}."
             g, u, dn = ep_ + "gate_proj.weight", ep_ + "up_proj.weight", ep_ + "down_proj.weight"
             if g not in hf or u not in hf:

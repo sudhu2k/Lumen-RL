@@ -800,8 +800,10 @@ class RDMAWeightSyncConfig:
 
 @dataclass
 class MoriWeightSyncConfig:
-    """Pull over MORI-IO XGMI: rollout ranks read a cached plan's regions from the
-    trainers' parameters. One node, BF16."""
+    """Pull over MORI-IO: rollout ranks read a cached plan's regions from the trainers'
+    parameters, over XGMI on one node. A rollout node other than the trainers'
+    fetches each byte its replicas need once over RDMA, on-rail, then hands it on
+    over XGMI. BF16."""
 
     # plan.pt from ``python -m lumenrl.tools.build_weight_map`` for this model and layout,
     # or "auto": built at startup from this run's config (a few minutes, once per model

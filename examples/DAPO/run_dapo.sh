@@ -191,7 +191,11 @@ echo "$LOG" > /tmp/run_dapo_log.txt
 echo "=== MODE=$MODE TRAIN_FP8=$TRAIN_FP8 STEPS=$STEPS  CONFIG=$CONFIG  LOG=$LOG ==="
 
 # 清理旧进程
-ray stop --force >/dev/null 2>&1 || true
+if [ "${LUMENRL_KEEP_RAY_CLUSTER:-0}" = "1" ]; then
+  echo "[run_dapo] LUMENRL_KEEP_RAY_CLUSTER=1 -> preserve existing Ray cluster"
+else
+  ray stop --force >/dev/null 2>&1 || true
+fi
 python3 - <<'PY'
 import os
 import signal

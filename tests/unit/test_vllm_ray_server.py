@@ -20,6 +20,12 @@ CAPABILITY = {
 }
 
 
+def test_node_groups_join_the_rdma_replicas_of_each_node():
+    # Replicas 0 and 2 on node A, 1 on node B, 3 colocated with the trainers.
+    groups = vllm_ray_server._node_groups([True, True, True, False], ["A", "B", "A", "T"], 4)
+    assert groups == [[0, 1, 2, 3, 8, 9, 10, 11], [4, 5, 6, 7]]
+
+
 def test_vllm_runtime_env_propagates_msccl_disable(monkeypatch):
     monkeypatch.setenv("RCCL_MSCCL_ENABLE", "0")
     env_vars = {}

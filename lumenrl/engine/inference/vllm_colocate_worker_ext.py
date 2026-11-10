@@ -447,6 +447,37 @@ class vLLMColocateWorkerExtension:
             dist.destroy_process_group(group)
         return True
 
+    def mori_rollout_gpu(self, replica: int) -> dict[str, int]:
+        """This worker's plan rollout rank and the rail MORI reads its buffers through
+        (-1 if unknown)."""
+        from vllm.distributed import parallel_state
+
+        from lumenrl.transfer.rail_topology import gpu_rail, pin_own_nic
+
+        world_group = parallel_state.get_world_group()
+        pin_own_nic(torch.cuda.current_device())
+        topo = gpu_rail(torch.cuda.current_device())
+        return {"dst_rank": int(replica) * int(world_group.world_size)
+                + int(world_group.rank_in_group),
+                "rail": topo.rail if topo is not None else -1}
+
+    def _mori_nic_report(self, dst_rank: int) -> dict[str, object]:
+        """The NIC MORI reads this rank's buffers through and its GPU's own NIC; warns
+        when they differ, since every byte then crosses the host's PCIe fabric."""
+        from lumenrl.transfer.rail_topology import gpu_rail, visible_order
+
+        topo = gpu_rail(torch.cuda.current_device())
+        if topo is None:
+            return {"nic": "", "own_nic": ""}
+        if topo.nic != topo.own_nic:
+            logger.warning(
+                "MORI reads rollout rank %d's buffers (GPU %s) through %s, not the GPU's own "
+                "%s: MORI matches NICs to GPUs by visible-device position (%s). Listing the "
+                "node's GPUs in bus order puts every rank on its own NIC.",
+                dst_rank, topo.bus, topo.nic, topo.own_nic, visible_order(),
+            )
+        return {"nic": topo.nic, "own_nic": topo.own_nic, "gpu_bus": topo.bus}
+
     def init_mori_weight_sync(
         self,
         plan_path: str,
@@ -458,13 +489,26 @@ class vLLMColocateWorkerExtension:
         num_streams: int = 64,
         hash_before: bool = False,
         strided: bool = True,
+        transport: str = "xgmi",
+        host: str | None = None,
+        groups: list | None = None,
+        rails: dict | None = None,
+        node_group: list | None = None,
+        node_key: str | None = None,
     ) -> dict[str, object]:
         """Register this worker's parameters as the local end of MORI reads.
 
         This worker is plan rollout rank ``replica * world + rank`` (its rank in
         the replica's vLLM world, the order the map builder uses). ``hash_before``
         returns the read hashes of the weights vLLM loaded itself, the reference
-        for the startup check.
+        for the startup check. With ``transport="rdma"`` the trainers are on another
+        node and ``host`` is this node's address: the node mirrors each trainer byte its
+        replicas need once, on-rail, and reads the plan from the mirrors as on one node
+        (``MoriNodeReader``).
+        ``node_group``: the plan ranks of every replica on this node, which share one
+        node plan; ``node_key`` names its exchange and signals. ``groups`` and
+        ``rails``: every rollout node's ranks and every rank's rail, so nodes choose
+        trainer holders in turn.
         """
         from vllm.distributed import parallel_state
 
@@ -478,18 +522,82 @@ class vLLMColocateWorkerExtension:
                              f"{plan.meta.get('vllm_world', 1)} ranks; this one has {world}")
         dst_rank = int(replica) * world + int(world_group.rank_in_group)
         model = self.model_runner.model
-        if plan.meta.get("staged_checkpoint"):
-            return self._init_mori_checkpoint_reader(plan, dst_rank, sources, num_streams,
-                                                     strided, hash_before)
+        rdma = str(transport) == "rdma"
         from lumenrl.engine.inference.vllm_fp8_utils import is_online_quant_model
 
-        if is_online_quant_model(self.model_runner.vllm_config):
+        checkpoint = bool(plan.meta.get("staged_checkpoint"))
+        online = is_online_quant_model(self.model_runner.vllm_config)
+        if checkpoint and not rdma:
+            return self._init_mori_checkpoint_reader(plan, dst_rank, sources, num_streams,
+                                                     strided, hash_before)
+        if checkpoint and not online:
+            raise ValueError(f"MORI weight plan is for online quantization "
+                             f"{plan.meta.get('quantization')!r}; this vLLM is not quantizing "
+                             "online")
+        if online and not checkpoint:
             raise ValueError(f"MORI weight plan {plan_path} copies into BF16 parameters; this "
                              "vLLM quantizes online and needs a plan built for it")
-        self._mori_reader = MoriWeightReader(
-            plan, dst_rank, dict(model.named_parameters()), list(sources),
-            window=int(window), num_streams=int(num_streams), strided=bool(strided),
-        )
+        if rdma:
+            import uuid
+
+            import torch.distributed as dist
+
+            from lumenrl.transfer.mori_node import MoriNodeReader, NodeExchange
+            from lumenrl.transfer.rail_topology import pin_own_nic
+
+            pin_own_nic(torch.cuda.current_device())
+
+            if not host:
+                raise ValueError("cross-node MORI weight sync needs this node's address")
+            cpu_group = world_group.cpu_group
+
+            def exchange(obj):
+                out = [None] * world
+                dist.all_gather_object(out, obj, group=cpu_group)
+                return out
+
+            # One node plan for every instance on this node: each byte is fetched once,
+            # straight into the weights or staging slot when only this GPU reads it,
+            # otherwise into a mirror of its trainer GPU, then read from there over XGMI.
+            group = [int(replica) * world + i for i in range(world)]
+            node = [int(d) for d in node_group or group]
+            if node != group:
+                node_ex = NodeExchange(str(node_key), len(node), node.index(dst_rank))
+                key = str(node_key)
+            else:
+                node_ex = exchange
+                key = exchange(uuid.uuid4().hex)[0]
+            self._mori_reader = r = MoriNodeReader(
+                plan, dst_rank, dict(model.named_parameters()), list(sources), group=node,
+                host=str(host), exchange=node_ex, signal_key=key, num_streams=int(num_streams),
+                groups=groups, rails={int(d): int(x) for d, x in (rails or {}).items()},
+            )
+            logger.warning(
+                "MORI node plan on rollout rank %d (rail %d): %.2f GB over the network in "
+                "%d reads, %d batches, %.2f GB of it straight into its weights, %.2f GB "
+                "straight into staging slots and the rest into a %.2f GB mirror; %.2f GB of "
+                "the mirrors read by other GPUs, %.2f GB read from theirs; node off-rail "
+                "%.2f GB, busiest rail %.2f GB; setup %.2fs",
+                dst_rank, r.rail, r.net_bytes / 1e9, len(r.entries), len(r.calls),
+                r.land_bytes / 1e9, r.stage_bytes / 1e9, r.mirror.numel() / 1e9,
+                r.out_bytes / 1e9, r.in_bytes / 1e9, r.node.offrail_bytes / 1e9,
+                max(r.node.rail_bytes.values()) / 1e9, r.setup_s,
+            )
+            if checkpoint:
+                out = {"dst_rank": dst_rank, "reads": len(r.entries), "rounds": len(r.calls),
+                       "bytes": r.bytes, "setup_s": r.setup_s, "strided": r.strided,
+                       "staging_bytes": r.staging_bytes, "staged_checkpoint": True,
+                       "transport": str(transport), **self._mori_nic_report(dst_rank),
+                       "rail_local_bytes": r.rail_local_bytes, "net_bytes": r.net_bytes,
+                       "out_bytes": r.out_bytes, "in_bytes": r.in_bytes}
+                if hash_before:
+                    out["digest"] = self.mori_param_digest()
+                return out
+        else:
+            self._mori_reader = MoriWeightReader(
+                plan, dst_rank, dict(model.named_parameters()), list(sources),
+                window=int(window), num_streams=int(num_streams), strided=bool(strided),
+            )
         r = self._mori_reader
         logger.warning(
             "MORI weight reader on rollout rank %d: %d reads in %d rounds, %.2f GB, "
@@ -500,7 +608,10 @@ class vLLMColocateWorkerExtension:
         out: dict[str, object] = {"dst_rank": dst_rank, "reads": len(r.entries),
                                   "rounds": len(r.calls), "bytes": r.bytes, "setup_s": r.setup_s,
                                   "strided": r.strided, "permuted": len(r.views),
-                                  "staging_bytes": r.staging_bytes}
+                                  "staging_bytes": r.staging_bytes, "transport": str(transport)}
+        if rdma:
+            out.update(self._mori_nic_report(dst_rank), rail_local_bytes=r.rail_local_bytes,
+                       net_bytes=r.net_bytes, out_bytes=r.out_bytes, in_bytes=r.in_bytes)
         if hash_before:
             out["hashes"] = r.hashes().tolist()
         return out
@@ -551,7 +662,7 @@ class vLLMColocateWorkerExtension:
         r = getattr(self, "_mori_reader", None)
         if r is None:
             raise RuntimeError("MORI weight reader is not initialized")
-        if isinstance(r, MoriCheckpointReader):
+        if isinstance(r, MoriCheckpointReader) or getattr(r, "checkpoint", False):
             stats = {"version": float(version), "dst_rank": r.dst_rank,
                      **self._sync_mori_checkpoint(r, verify)}
         else:

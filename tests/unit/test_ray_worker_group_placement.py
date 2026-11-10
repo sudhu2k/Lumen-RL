@@ -1,6 +1,13 @@
 import pytest
 
-from lumenrl.controller.ray_worker_group import _placement_node_ips
+from lumenrl.controller.ray_worker_group import _bundle_order, _placement_node_ips
+
+
+def test_bundle_order_follows_gpu_ids() -> None:
+    gpu_ids = [0, 4, 2, 1, 5, 3, 7, 6]       # what Ray bound a DAPO run's bundles to
+    order = _bundle_order(gpu_ids)
+    assert [gpu_ids[i] for i in order] == list(range(8))
+    assert _bundle_order([3, -1, 1]) == [2, 0, 1]   # unknown GPUs last
 
 
 def test_placement_node_ips_assigns_one_ip_per_process_group() -> None:

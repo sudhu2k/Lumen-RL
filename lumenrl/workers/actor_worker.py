@@ -1063,11 +1063,14 @@ class LumenActorWorker(BaseWorker):
     def rdma_preflight(self, interface: str, hca: str) -> dict[str, Any]:
         from pathlib import Path
 
+        from lumenrl.utils.distributed import missing_rdma_hcas
+
         uverbs = sorted(Path("/dev/infiniband").glob("uverbs*"))
-        hca_path = Path("/sys/class/infiniband") / hca
-        if not uverbs or not hca_path.exists():
+        missing = missing_rdma_hcas(hca)
+        if not uverbs or missing:
             raise RuntimeError(
-                f"RDMA unavailable in actor container: uverbs={uverbs}, hca={hca}"
+                f"RDMA unavailable in actor container: uverbs={uverbs}, hca={hca}, "
+                f"missing={missing}"
             )
         rendezvous = self.get_rdma_rendezvous(interface)
         return {
@@ -1192,11 +1195,13 @@ class LumenActorWorker(BaseWorker):
         return True
 
     def init_mori_weight_source(
-        self, plan_path: str, n_dst: int, num_streams: int = 64,
+        self, plan_path: str, n_dst: int, num_streams: int = 64, rdma: bool = False,
     ) -> Any:
         """Register this rank's parameters as MORI read sources; returns the export
-        the rollout ranks need to read them."""
+        the rollout ranks need to read them. With ``rdma`` also for readers on other
+        nodes."""
         from lumenrl.transfer.mori_weight_transfer import MoriWeightSource, load_plan
+        from lumenrl.transfer.weight_source_map import mori_source_tensors
 
         module = getattr(self._engine, "module", None)
         if module is None or not hasattr(self._engine, "_spec"):
@@ -1211,11 +1216,13 @@ class LumenActorWorker(BaseWorker):
         plan = load_plan(plan_path, n_src=self.world_size, n_dst=int(n_dst))
         torch.cuda.synchronize()
         self._mori_source = MoriWeightSource(
-            plan, self.rank, dict(module.named_parameters()), num_streams=int(num_streams),
+            plan, self.rank, dict(mori_source_tensors(module)), num_streams=int(num_streams),
+            rdma_host=self.get_node_ip() if rdma else None,
         )
         logger.info(
-            "MORI weight source on rank %d: %d plan sources in %d registrations",
+            "MORI weight source on rank %d: %d plan sources in %d registrations%s",
             self.rank, len(self._mori_source.params), len(self._mori_source.memories),
+            ", RDMA too" if rdma else "",
         )
         return self._mori_source.export().to_wire()
 

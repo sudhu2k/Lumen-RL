@@ -29,7 +29,7 @@ import torch.nn.functional as F
 
 from lumenrl.core.protocol import DataProto
 from lumenrl.engine.training.base_engine import EngineRegistry
-from lumenrl.engine.training.bridges import dsv4
+from lumenrl.engine.training.bridges import dsv3, dsv4
 from lumenrl.engine.training.bridges.core import (
     expert_local_index,
     load_hf_safetensors,
@@ -825,7 +825,10 @@ class MegatronNativeEngine(MegatronBaseEngine):
         sequential (``experts.local_experts.{e}.linear_fc{1,2}.weight``) naming.
         """
         from megatron.core import parallel_state as mpu
-        from megatron.core.dist_checkpointing.mapping import ShardedTensor
+        from megatron.core.dist_checkpointing.mapping import (
+            ShardedTensor,
+            ShardedTensorFactory,
+        )
 
         d = self._dims
         ep = mpu.get_expert_model_parallel_world_size()
@@ -840,7 +843,11 @@ class MegatronNativeEngine(MegatronBaseEngine):
             )
         moe_ffn = d.moe_ffn
 
-        non_expert_full = non_expert_hf_to_megatron(hf_state, d)
+        tp_rank = mpu.get_tensor_model_parallel_rank()
+        if self._spec.name == "deepseek_v3":
+            non_expert_full = dsv3.hf_to_megatron(hf_state, d, routed_experts=False)
+        else:
+            non_expert_full = non_expert_hf_to_megatron(hf_state, d)
         ssd = model.sharded_state_dict()
         offset = _pp_layer_offset(model)
 
@@ -880,7 +887,22 @@ class MegatronNativeEngine(MegatronBaseEngine):
                 if isinstance(st, ShardedTensor):
                     sl = st.global_slice()[st.prepend_axis_num:]
                     full = full[sl]
+                elif isinstance(st, ShardedTensorFactory):
+                    # Fused SwiGLU fc1 of a dense or shared-expert MLP (DSv3):
+                    # [gate; up], each column-parallel.
+                    assert name.endswith("linear_fc1.weight"), f"unexpected factory: {name}"
+                    half = full.shape[0] // 2
+                    shard = half // tp
+                    full = torch.cat(
+                        [full[tp_rank * shard:(tp_rank + 1) * shard],
+                         full[half + tp_rank * shard:half + (tp_rank + 1) * shard]], dim=0,
+                    )
             local_sd[name] = full.contiguous().to(torch.bfloat16)
+        # The noaux_tc router bias is a persistent buffer: replicated, kept in fp32.
+        for name, _ in model.named_buffers():
+            gkey = _to_global_key(name, offset)
+            if name.endswith("mlp.router.expert_bias") and gkey in non_expert_full:
+                local_sd[name] = non_expert_full[gkey].to(torch.float32).contiguous()
         del non_expert_full
         return local_sd
 

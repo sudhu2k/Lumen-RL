@@ -102,6 +102,21 @@ def test_pipeline_stages_publish_global_layer_numbers():
     _run_shard_worker("29608", tp=1, pp=2, ep=1, layers=4)
 
 
+@pytest.mark.multigpu
+@pytest.mark.skipif(_visible_gpus() < 2, reason="needs 2 GPUs for TP=2/EP=2")
+@pytest.mark.parametrize("q_lora", [32, 0], ids=["q_lora", "full_rank_q"])
+def test_engine_loader_and_export_round_trip_under_tp2_ep2(q_lora):
+    """HF -> the engine's sharded loader -> its export must return every HF tensor
+    bit-identical: the dense and shared-expert fused fc1 split across TP, the routed
+    experts by EP, the router bias buffer, and both q projection variants."""
+    _run(
+        HERE / "_dsv3_load_worker.py", "DSV3_LOAD_OK",
+        launcher=["-m", "torch.distributed.run", "--nproc_per_node=2", "--master_port=29609"],
+        HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES", "0,1"),
+        DSV3_TP=2, DSV3_EP=2, DSV3_Q_LORA=q_lora,
+    )
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(_visible_gpus() < 1, reason="needs a GPU")
 @pytest.mark.skipif(_checkpoint() is None, reason=f"no DSv3 checkpoint under {_CKPT_GLOB}")

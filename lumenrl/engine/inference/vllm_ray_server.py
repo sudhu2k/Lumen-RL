@@ -78,6 +78,16 @@ def _by_rollout_rank(per_replica: list) -> list[dict]:
     return rows
 
 
+def _node_groups(cross: list[bool], server_ips: list[str], tp: int) -> list[list[int]]:
+    """The plan rollout ranks of the RDMA replicas, one list per rollout node: the
+    replicas on a node in replica order, each ``tp`` consecutive ranks."""
+    nodes: dict[str, list[int]] = {}
+    for r, (c, ip) in enumerate(zip(cross, server_ips)):
+        if c:
+            nodes.setdefault(ip, []).extend(r * tp + i for i in range(tp))
+    return list(nodes.values())
+
+
 def _copy_vllm_runtime_env(env_vars: dict[str, str]) -> None:
     for key in _VLLM_RUNTIME_ENV_KEYS:
         if key in os.environ:
@@ -335,10 +345,14 @@ class VLLMRayServer:
     def rdma_preflight(self, interface: str, hca: str) -> dict[str, Any]:
         from pathlib import Path
 
+        from lumenrl.utils.distributed import missing_rdma_hcas
+
         uverbs = sorted(Path("/dev/infiniband").glob("uverbs*"))
-        if not uverbs or not (Path("/sys/class/infiniband") / hca).exists():
+        missing = missing_rdma_hcas(hca)
+        if not uverbs or missing:
             raise RuntimeError(
-                f"RDMA unavailable in rollout container: uverbs={uverbs}, hca={hca}"
+                f"RDMA unavailable in rollout container: uverbs={uverbs}, hca={hca}, "
+                f"missing={missing}"
             )
         if os.environ.get("NCCL_IB_DISABLE", "0") == "1":
             raise RuntimeError("NCCL_IB_DISABLE=1 would force Socket transport")
@@ -394,6 +408,15 @@ class VLLMRayServer:
 
     async def init_mori_weight_sync(self, **kwargs: Any) -> Any:
         return await self.engine.collective_rpc("init_mori_weight_sync", kwargs=kwargs)
+
+    async def mori_rollout_gpus(self, replica: int) -> Any:
+        return await self.engine.collective_rpc("mori_rollout_gpu",
+                                                kwargs={"replica": int(replica)})
+
+    def node_ip(self) -> str:
+        import ray
+
+        return ray.util.get_node_ip_address()
 
     async def receive_weights_mori(self, version: int, verify: bool = False,
                                    digest: bool = False) -> Any:
@@ -529,8 +552,12 @@ class VLLMReplicaManager:
         max_concurrency: int = 64,
         base_seed: Optional[int] = None,
         tensor_parallel_size: int = 1,
+        gpu_order_wg=None,
     ) -> None:
         self.actor_wg = actor_wg
+        # Separation mode: the trainer workers, whose GPU indices the replicas' ranks
+        # follow (``create``).
+        self.gpu_order_wg = gpu_order_wg
         self.model_name = model_name
         self.engine_kwargs = dict(engine_kwargs)
         self.base_port = int(base_port)
@@ -565,6 +592,11 @@ class VLLMReplicaManager:
         Supports TP>1: when ``engine_kwargs["tensor_parallel_size"] > 1``,
         groups consecutive workers (by their GPU IDs) into multi-GPU replicas,
         mirroring ATOMReplicaManager's grouping logic.
+
+        With ``gpu_order_wg`` (trainers on other nodes), a replica's GPUs are visible
+        in bus order: MORI picks a GPU's NIC by its visible-device position, so only
+        that order reads each rank's buffers through its GPU's own NIC. The readers
+        plan around wherever the trainer ranks run (``rail_topology``).
         """
         import ray
         from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -572,6 +604,8 @@ class VLLMReplicaManager:
         job_id = ray.get_runtime_context().get_job_id()
         infos = self.actor_wg.execute_all_sync("get_colocation_info")
         logger.info("VLLMReplicaManager: colocation infos = %s", infos)
+        order = (self.gpu_order_wg.execute_all_sync("get_colocation_info")
+                 if self.gpu_order_wg is not None else None)
 
         tp = self.tensor_parallel_size
         num_workers = len(infos)
@@ -596,7 +630,19 @@ class VLLMReplicaManager:
             node_id = group[0]["node_id"]
             # Visible device j of the engine is actor (r*tp + j)'s physical GPU,
             # which is what makes the sender's rank % tp the receiver's local_rank.
-            gpu_ids_str = ",".join(str(g) for info in group for g in info["gpu_ids"])
+            gpu_ids = [str(g) for info in group for g in info["gpu_ids"]]
+            if order is not None:
+                # MORI gives the i-th visible GPU the i-th best free NIC, so only bus
+                # order puts each rank on its GPU's own NIC (rail_topology).
+                gpu_ids = sorted(gpu_ids, key=int)
+                want = [str(g) for info in order[r * tp:(r + 1) * tp] for g in info["gpu_ids"]]
+                logger.info("VLLMReplicaManager: replica %d ranks 0..%d on GPUs %s; trainer "
+                            "ranks %d..%d on GPUs %s", r, tp - 1, gpu_ids, r * tp,
+                            r * tp + tp - 1, want)
+            else:
+                logger.info("VLLMReplicaManager: replica %d ranks 0..%d on GPUs %s",
+                            r, tp - 1, gpu_ids)
+            gpu_ids_str = ",".join(gpu_ids)
             # ROCm device pinning: select the physical GPU via CUDA/HIP visible
             # devices ONLY. Do NOT also set ROCR_VISIBLE_DEVICES to the physical
             # index -- ROCR filters at a lower level, so ROCR=<phys>+HIP=<phys>
@@ -881,6 +927,12 @@ class VLLMReplicaManager:
         """Trainer ranks register their sources, then every vLLM worker its reader.
 
         Each worker of replica ``r`` is plan rollout rank ``r * tp + its rank``.
+        A replica with any trainer rank on another node reads over RDMA (the
+        trainers then register their sources with an RDMA engine as well). The
+        replicas on one rollout node form one node plan (``node_group``,
+        ``node_key``): each byte the node needs is fetched once, then handed on over
+        XGMI. Every RDMA reader gets the node groups and every rollout rank's rail,
+        so nodes choose trainer holders in turn and spread over the trainer copies.
         Returns the trainer exports and every worker's reader summary, in rollout
         rank order.
         """
@@ -888,15 +940,28 @@ class VLLMReplicaManager:
 
         n_src = int(actor_wg.num_workers)
         n_dst = len(self.servers) * int(self.tensor_parallel_size)
+        actor_ips = set(actor_wg.execute_all_sync("get_node_ip"))
+        server_ips = ray.get([server.node_ip.remote() for server in self.servers])
+        cross = [actor_ips != {ip} for ip in server_ips]
         exports = actor_wg.execute_all_sync(
             "init_mori_weight_source",
-            plan_path=plan_path, n_dst=n_dst, num_streams=int(num_streams),
+            plan_path=plan_path, n_dst=n_dst, num_streams=int(num_streams), rdma=any(cross),
         )
+        tp = int(self.tensor_parallel_size)
+        nodes = _node_groups(cross, server_ips, tp)
+        node_of = {d // tp: i for i, g in enumerate(nodes) for d in g}
+        job = uuid4().hex[:12]
+        rails = {int(g["dst_rank"]): int(g["rail"]) for r, server in enumerate(self.servers)
+                 if cross[r] for g in ray.get(server.mori_rollout_gpus.remote(r))}
         readers = ray.get([
             server.init_mori_weight_sync.remote(
                 plan_path=plan_path, replica=r, sources=exports, n_src=n_src,
                 n_dst=n_dst, window=int(window), num_streams=int(num_streams),
                 strided=bool(strided), hash_before=bool(hash_before),
+                transport="rdma" if cross[r] else "xgmi", host=server_ips[r],
+                groups=nodes, rails=rails,
+                node_group=nodes[node_of[r]] if r in node_of else None,
+                node_key=f"{job}-{node_of[r]}" if r in node_of else None,
             )
             for r, server in enumerate(self.servers)
         ])

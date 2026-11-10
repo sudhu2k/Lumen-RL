@@ -29,7 +29,7 @@ from collections.abc import Mapping
 import torch
 import torch.distributed as dist
 
-from lumenrl.transfer.weight_source_map import CheckpointIndex, capture
+from lumenrl.transfer.weight_source_map import CheckpointIndex, capture, mori_source_tensors
 
 
 class LazyIdState(Mapping):
@@ -116,7 +116,8 @@ def main() -> None:
             real_missing = [k for k in missing.missing_keys if "_extra_state" not in k]
             if real_missing:
                 raise RuntimeError(f"rank {rank}: missing keys {real_missing[:6]}")
-            return {n: p.detach() for n, p in model.named_parameters()}
+            # Megatron allocates the router bias buffer on the GPU even here.
+            return {n: p.detach().cpu() for n, p in mori_source_tensors(model)}
 
         t0 = time.time()
         if args.real:

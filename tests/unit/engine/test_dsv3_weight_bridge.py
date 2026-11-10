@@ -42,8 +42,17 @@ TINY = {
 
 @pytest.fixture(scope="module")
 def tiny_model():
+    yield from _build(TINY)
+
+
+@pytest.fixture(scope="module")
+def full_rank_q_model():
+    """Moonlight / DeepSeek-V2-Lite shape: ``q_lora_rank`` null, one q projection."""
+    yield from _build({**TINY, "q_lora_rank": None})
+
+
+def _build(hf):
     """A real Megatron DSv3 model at TP=PP=EP=1, or skip if we cannot build one."""
-    torch.distributed = torch.distributed  # noqa: PLW0127  (readability)
     import torch.distributed as dist
 
     if not dist.is_available():
@@ -65,11 +74,11 @@ def tiny_model():
             mpu.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(0)
 
-        cfg = dsv3.build_dsv3_config(TINY, {"moe_grouped_gemm": True})
+        cfg = dsv3.build_dsv3_config(hf, {"moe_grouped_gemm": True})
         spec = get_gpt_decoder_block_spec(cfg, use_transformer_engine=True)
         model = GPTModel(
             config=cfg, transformer_layer_spec=spec,
-            vocab_size=TINY["vocab_size"], max_sequence_length=64,
+            vocab_size=hf["vocab_size"], max_sequence_length=64,
             pre_process=True, post_process=True,
             share_embeddings_and_output_weights=False,
             position_embedding_type="rope", parallel_output=False,
@@ -201,3 +210,25 @@ def test_sequential_expert_layout_round_trips_too(tiny_model):
     back = dsv3.hf_to_megatron(hf, dsv3.build_dsv3_dims(TINY), use_grouped_mlp=False)
     assert "decoder.layers.1.mlp.experts.local_experts.0.linear_fc1.weight" in back
     assert "decoder.layers.1.mlp.experts.linear_fc1.weight0" not in back
+
+
+# --- full-rank q (q_lora_rank null) --------------------------------------------
+
+def test_full_rank_q_exports_q_proj_and_no_lora_names(full_rank_q_model):
+    hf = _export(full_rank_q_model)
+    q = hf["model.layers.0.self_attn.q_proj.weight"]
+    assert q.shape == (4 * (16 + 8), 128)
+    assert not [k for k in hf if "q_a_" in k or "q_b_proj" in k]
+    assert "model.layers.0.self_attn.kv_a_layernorm.weight" in hf
+
+
+def test_full_rank_q_round_trips_every_parameter(full_rank_q_model):
+    original = {n: p.detach() for n, p in full_rank_q_model.named_parameters()}
+    back = dsv3.hf_to_megatron(
+        _export(full_rank_q_model),
+        dsv3.build_dsv3_dims({**TINY, "q_lora_rank": None}),
+        use_grouped_mlp=True,
+    )
+    assert not sorted(set(original) - set(back))
+    for name, want in original.items():
+        assert torch.equal(back[name], want), name
