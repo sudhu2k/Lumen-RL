@@ -149,11 +149,38 @@ def test_tensor_digest_independent_of_chunking(n):
 
 @pytest.mark.parametrize("engine, strided", [(_Engine, True), (_StridedEngine, False)])
 def test_plain_reads_without_strided_api_or_when_off(mori, engine, strided):
+    """The strided row is contiguous at the source: one read into the spread buffer."""
     mori(engine)
     r = _reader(strided=strided)
-    assert not r.strided and len(r.entries) == 4
+    assert not r.strided and len(r.entries) == 2
     r.sync()
     (kind, lo, ro, sz), = r.eng.calls
     assert kind == "plain"
-    assert (lo[0], ro[0], sz[0]) == ([0, 32, 64, 96], [0, 16, 32, 64], [16, 16, 16, 32])
+    reads = sorted((a, b, n) for g in zip(lo, ro, sz) for a, b, n in zip(*g))
+    assert reads == [(0, 0, 48), (96, 64, 32)]
     assert r.bytes == 3 * 16 + 32
+
+
+class _PlainCopyEngine(_Engine):
+    """Does the reads without a strided API: local memories are uint8 tensors."""
+
+    def batch_read(self, ld, lo, rd, ro, sz, uids):
+        super().batch_read(ld, lo, rd, ro, sz, uids)
+        for dst, los, _, ros, szs in zip(ld, lo, rd, ro, sz):
+            for a, b, n in zip(los, ros, szs):
+                dst[a:a + n] = _SRC[b:b + n]
+        return [_Status() for _ in sz]
+
+
+def test_plain_reads_spread_destination_strided_rows_after_their_round(mori, monkeypatch):
+    import ctypes
+
+    mori(_PlainCopyEngine)
+    monkeypatch.setattr(mwt, "_register", lambda eng, ptr, nbytes, device: torch.frombuffer(
+        (ctypes.c_uint8 * nbytes).from_address(ptr), dtype=torch.uint8))
+    r = _reader()
+    r.sync()
+    want = torch.zeros(128, dtype=torch.uint8)
+    want.as_strided((3, 16), (32, 1)).copy_(_SRC[:48].view(3, 16))
+    want[96:] = _SRC[64:96]
+    assert torch.equal(r.tensors[0], want)

@@ -9,10 +9,8 @@ not which physical GPU it is; with ``MORI_IO_RAIL_AFFINITY=1`` the passive side 
 on the NIC with the same index. A GPU's own NIC is the one that match gives it with
 every GPU of the node visible in bus order; a NIC reading another GPU's memory crosses
 the host's PCIe fabric, which hypervisors may hide (all devices under one root).
-
-MORI only considers the NICs ``MORI_RDMA_DEVICES`` allows (a comma list, or ``^`` and a
-list to exclude). ``pin_own_nic`` narrows it to a reader's own NIC when the match above
-would give it another one, as for a process that sees one GPU of the node.
+MORI builds whose matcher pairs NICs over every GPU of the host and then looks up the
+visible ones give each GPU its own NIC; ``LUMEN_MORI_NIC_MATCH=node`` says MORI is one.
 """
 
 from __future__ import annotations
@@ -26,8 +24,7 @@ from dataclasses import asdict, dataclass
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["Nic", "GpuRail", "match_nics", "mori_allowed", "rails_of", "gpu_rail",
-           "pin_own_nic", "visible_order"]
+__all__ = ["Nic", "GpuRail", "match_nics", "rails_of", "gpu_rail", "visible_order"]
 
 _GPU_CLASSES = ("0x03", "0x12")  # display, processing accelerator
 _AMD = "0x1002"
@@ -161,7 +158,10 @@ def rails_of(nics: Sequence[Nic], gpu: str, visible: Sequence[str], node: Sequen
     build."""
     active = sorted(n.name for n in nics if n.gbps > 0)
     seen = mori_allowed(nics, mori_devices)
-    nic = match_nics(visible, seen, paths, numa)[list(visible).index(gpu)]
+    if os.environ.get("LUMEN_MORI_NIC_MATCH", "visible") == "node" and gpu in node:
+        nic = match_nics(node, seen, paths, numa)[list(node).index(gpu)]
+    else:
+        nic = match_nics(visible, seen, paths, numa)[list(visible).index(gpu)]
     own = match_nics(node, nics, paths, numa)[list(node).index(gpu)] if gpu in node else ""
     return GpuRail(gpu, nic, active.index(nic) if nic in active else -1,
                    own, active.index(own) if own in active else -1)
@@ -186,30 +186,6 @@ def gpu_rail(device: int, root: str = "/") -> GpuRail | None:
     except (OSError, ValueError, IndexError) as e:
         logger.warning("rail topology unavailable for GPU %s: %s", device, e)
         return None
-
-
-def pin_own_nic(device: int, root: str = "/") -> str | None:
-    """Limit this process's MORI RDMA backend to GPU ``device``'s own NIC when MORI would
-    read its buffers through another one; returns the NIC pinned, else None. Only for
-    readers: a passive source answers on the reader's rail and needs every NIC. Must run
-    before MORI's first RDMA engine in the process, which reads the variable once. A
-    ``MORI_RDMA_DEVICES`` already set is narrowed to the own NIC if it allows it, else
-    left alone; ``LUMEN_MORI_PIN_NIC=0`` turns this off."""
-    if os.environ.get("LUMEN_MORI_PIN_NIC") == "0":
-        return None
-    topo = gpu_rail(device, root)
-    if topo is None or not topo.own_nic or topo.nic == topo.own_nic:
-        return None
-    spec = os.environ.get("MORI_RDMA_DEVICES")
-    if spec and topo.own_nic not in {n.name for n in mori_allowed(_nics(root), spec)}:
-        logger.warning("GPU %s's own NIC %s is excluded by MORI_RDMA_DEVICES=%s; MORI reads "
-                       "its buffers through %s", topo.bus, topo.own_nic, spec, topo.nic)
-        return None
-    os.environ["MORI_RDMA_DEVICES"] = topo.own_nic
-    gpu_rail.cache_clear()
-    logger.info("MORI RDMA limited to %s, GPU %s's own NIC, instead of %s (%s)",
-                topo.own_nic, topo.bus, topo.nic, visible_order())
-    return topo.own_nic
 
 
 def visible_order() -> str:

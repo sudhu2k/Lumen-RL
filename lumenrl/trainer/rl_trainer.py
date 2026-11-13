@@ -1304,11 +1304,18 @@ class RLTrainer:
             stage_b = sum(float(r.get("stage_bytes", 0.0)) for r in rows)
             mirror_b = max(float(r.get("mirror_bytes", 0.0)) for r in rows)
             gate_s = max(float(r["gate_wait_s"]) for r in rows)
+            pack_b = sum(float(r.get("pack_bytes", 0.0)) for r in rows)
+            pack_s = max(float(r.get("pack_s", 0.0)) for r in rows)
             secs = [float(r["seconds"]) for r in rows]
             slow = secs.index(max(secs))
+            gaps = [float(r.get("poll_gap_s", 0.0)) for r in rows]
+            gap_r = gaps.index(max(gaps))
             self._last_weight_sync_metrics.update({
+                "timing/weight_sync_mori_poll_gap_s": gaps[gap_r],
                 "timing/weight_sync_mori_net_s": max(float(r["net_s"]) for r in rows),
                 "timing/weight_sync_mori_gate_wait_s": gate_s,
+                "timing/weight_sync_mori_pack_s": pack_s,
+                "weight_sync/pack_bytes": pack_b,
                 "weight_sync/net_bytes": net_b,
                 "weight_sync/in_place_bytes": land_b,
                 "weight_sync/stage_bytes": stage_b,
@@ -1320,6 +1327,8 @@ class RLTrainer:
                        f"mirrors up to {mirror_b / 1e9:.2f}GB per GPU; XGMI "
                        f"{out_b / 1e9:.1f}GB "
                        f"from other GPUs' mirrors, longest wait for mirrors {gate_s:.3f}s; "
+                       f"packed {pack_b / 1e9:.1f}GB in the mirrors, longest {pack_s:.3f}s; "
+                       f"longest gap between network polls {gaps[gap_r]:.3f}s on rank {gap_r}; "
                        f"slowest rank {slow} {secs[slow]:.3f}s; per rank "
                        f"{' '.join(f'{s:.3f}' for s in secs)})")
         elif permuted:

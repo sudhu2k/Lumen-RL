@@ -56,6 +56,15 @@ def test_a_process_with_one_gpu_takes_the_best_nic_and_its_own_is_known():
     assert (r.nic, r.own_nic) == ("ionic_4", "ionic_5")      # first numa-1 NIC by name
 
 
+def test_a_mori_matching_over_the_host_gives_every_process_its_own_nic(monkeypatch):
+    monkeypatch.setenv("LUMEN_MORI_NIC_MATCH", "node")
+    gpus, nics, paths, numa = _flat()
+    for visible in ([gpus[5]], [gpus[2], gpus[3]], [gpus[i] for i in (0, 2, 1, 3, 7, 4, 5, 6)]):
+        for g in visible:
+            r = rails_of(nics, g, visible, gpus, paths, numa)
+            assert r.nic == r.own_nic == f"ionic_{gpus.index(g)}" and r.rail == r.own_rail
+
+
 def test_rails_skip_nics_without_an_active_port():
     gpus, nics, paths, numa = _flat()
     nics = [Nic(n.name, n.bus, 0.0 if n.name == "ionic_0" else n.gbps, n.numa) for n in nics]
@@ -120,55 +129,6 @@ def test_mori_rdma_devices_gives_a_one_gpu_process_its_own_nic_and_keeps_rails()
     gpus, nics, paths, numa = _flat()
     r = rails_of(nics, gpus[5], [gpus[5]], gpus, paths, numa, "ionic_5")
     assert (r.nic, r.rail, r.own_nic, r.own_rail) == ("ionic_5", 5, "ionic_5", 5)
-
-
-def _one_gpu_process(tmp_path, monkeypatch, gpu):
-    gpus = [(f"0002:00:0{i}.0", 0) for i in (1, 2, 3)]
-    _sysfs(tmp_path, gpus, [(f"ionic_{k}", f"0002:00:0{'9ab'[k]}.0", 0, "4: ACTIVE")
-                            for k in range(3)])
-    monkeypatch.setattr(rt, "_visible_gpus", lambda: [gpus[gpu][0]])
-    for v in ("MORI_RDMA_DEVICES", "LUMEN_MORI_PIN_NIC"):
-        monkeypatch.setenv(v, "")              # restored, or removed, after the test
-        monkeypatch.delenv(v)
-    rt.gpu_rail.cache_clear()
-    return str(tmp_path)
-
-
-def test_pin_own_nic_limits_a_one_gpu_reader_to_its_own_nic(tmp_path, monkeypatch):
-    root = _one_gpu_process(tmp_path, monkeypatch, 2)
-    assert rt.gpu_rail(0, root).nic == "ionic_0"
-    assert rt.pin_own_nic(0, root) == "ionic_2"
-    assert rt.os.environ["MORI_RDMA_DEVICES"] == "ionic_2"
-    r = rt.gpu_rail(0, root)
-    assert (r.nic, r.rail, r.own_nic, r.own_rail) == ("ionic_2", 2, "ionic_2", 2)
-    rt.gpu_rail.cache_clear()
-
-
-def test_pin_own_nic_leaves_a_reader_already_on_its_own_nic(tmp_path, monkeypatch):
-    root = _one_gpu_process(tmp_path, monkeypatch, 0)
-    assert rt.pin_own_nic(0, root) is None
-    assert "MORI_RDMA_DEVICES" not in rt.os.environ
-    rt.gpu_rail.cache_clear()
-
-
-@pytest.mark.parametrize("spec", ["ionic_0,ionic_1,ionic_2", "^mlx5_0"])
-def test_pin_own_nic_narrows_a_list_that_allows_the_own_nic(tmp_path, monkeypatch, spec):
-    root = _one_gpu_process(tmp_path, monkeypatch, 2)
-    monkeypatch.setenv("MORI_RDMA_DEVICES", spec)
-    assert rt.pin_own_nic(0, root) == "ionic_2"
-    assert rt.os.environ["MORI_RDMA_DEVICES"] == "ionic_2"
-    rt.gpu_rail.cache_clear()
-
-
-@pytest.mark.parametrize("env", [{"MORI_RDMA_DEVICES": "ionic_0,ionic_1"},
-                                 {"LUMEN_MORI_PIN_NIC": "0"}])
-def test_pin_own_nic_respects_the_user(tmp_path, monkeypatch, env):
-    root = _one_gpu_process(tmp_path, monkeypatch, 2)
-    for k, v in env.items():
-        monkeypatch.setenv(k, v)
-    assert rt.pin_own_nic(0, root) is None
-    assert rt.os.environ.get("MORI_RDMA_DEVICES") == env.get("MORI_RDMA_DEVICES")
-    rt.gpu_rail.cache_clear()
 
 
 def test_gpu_rail_is_none_without_rdma_nics(tmp_path):

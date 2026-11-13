@@ -440,10 +440,39 @@ class MoriWeightReader:
         self.staging_bytes = slot_bytes * len(self.slots)
 
         self.strided = bool(strided) and hasattr(self.eng, "batch_read_strided")
-        self.entries = _entries(read[~is_local], self.strided)
+        remote_rows = read[~is_local]
+        # Without strided reads, rows contiguous at the source but of small rows at a
+        # destination stride are read whole into a buffer and spread by a local copy
+        # once their round has landed, instead of one read per row.
+        self.unstage: dict[int, list[tuple[torch.Tensor, torch.Tensor]]] = defaultdict(list)
+        unstage_rows: list[tuple[list, int]] = []
+        fill = 0
+        if not self.strided:
+            spread = ((remote_rows[:, _NR] > 1) & (remote_rows[:, _SS] == remote_rows[:, _RB])
+                      & (remote_rows[:, _DS] != remote_rows[:, _RB])
+                      & (remote_rows[:, _RB] < int(os.environ.get("LUMEN_MORI_SMALL_ROW_KB", 64)) << 10))
+            spread &= ~torch.isin(remote_rows[:, _DP], torch.tensor(sorted(self.views), dtype=torch.int64))
+            for r in remote_rows[spread].tolist():
+                unstage_rows.append((r, fill))
+                fill += -(-r[_RB] * r[_NR] // 256) * 256
+            remote_rows = remote_rows[~spread]
+        self.unstage_buf = torch.empty(max(fill, 256), dtype=torch.uint8, device=self.device)
+        self.unstage_mem = (_register(self.eng, self.unstage_buf.data_ptr(), self.unstage_buf.numel(),
+                                      self.device) if unstage_rows else None)
+        for r, off in unstage_rows:
+            src = self.unstage_buf[off:off + r[_RB] * r[_NR]].view(r[_NR], r[_RB])
+            dst = _flat(self.tensors[r[_DP]])
+            self.unstage[r[_ROUND]].append(
+                (dst.as_strided((r[_NR], r[_RB]), (r[_DS], 1), dst.storage_offset() + r[_DO]), src))
+        self.entries = _entries(remote_rows, self.strided)
+        self.entries += [(r[_ROUND], r[_SRC], -1, off, r[_SP], r[_SO], r[_RB] * r[_NR], 1,
+                          r[_RB] * r[_NR], r[_RB] * r[_NR]) for r, off in unstage_rows]
+        self.staging_bytes += fill if unstage_rows else 0
 
         direct_entries = [e for e in self.entries if e[2] not in self.views]
-        self.calls = _read_calls(direct_entries, by_rank, remote, self.local, at.__getitem__)
+        self.calls = _read_calls(direct_entries, by_rank, remote, self.local,
+                                 lambda dp: 0 if dp < 0 else at[dp],
+                                 lambda dp: self.unstage_mem if dp < 0 else self.local)
         self.call_rounds = sorted({e[0] for e in direct_entries})
         # Per permuted tensor and slot: all its reads as one batch (rounds merged).
         self.staged = [(q, [(_read_calls([(0, *e[1:]) for e in self.entries if e[2] == q],
@@ -514,6 +543,11 @@ class MoriWeightReader:
             for args in staged:
                 place(*args)
 
+        def landed(rnd, statuses) -> None:
+            drain(statuses)
+            for d, s in self.unstage.get(rnd, ()):
+                d.copy_(s)
+
         stage([(q, lambda slot, q=q: self.fetch(q, slot), None) for q in self.fetched])
         for rnd in sorted(set(calls) | set(self.direct_copies)):
             if gate is not None:
@@ -522,10 +556,10 @@ class MoriWeightReader:
                 d.copy_(s)
             if rnd in calls:
                 while len(pending) >= self.window:
-                    drain(pending.pop(0))
-                pending.append(issue(calls[rnd]))
-        for statuses in pending:
-            drain(statuses)
+                    landed(*pending.pop(0))
+                pending.append((rnd, issue(calls[rnd])))
+        for args in pending:
+            landed(*args)
         t_direct = time.perf_counter() - t0
         stage([(q, lambda slot, c=c: issue(c[slot]), self.staged_rounds[q])
                for q, c in self.staged])

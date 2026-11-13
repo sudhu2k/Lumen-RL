@@ -4,8 +4,10 @@ waits on the others' mirrors."""
 
 import itertools
 import os
+import re
 import sys
 import threading
+import time
 import types
 
 import pytest
@@ -58,7 +60,8 @@ def _fetched(node):
     return [k[:4] for batches in node.fetch for b in batches for k in b]
 
 
-def test_plan_node_mirrors_each_range_once_on_rail():
+def test_plan_node_mirrors_each_range_once_on_rail(monkeypatch):
+    monkeypatch.setenv("LUMEN_MORI_NODE_PACK", "0")
     plan = _plan()
     node = plan_node(plan, _exports(), [0, 1], [0, 1], _SMALL)
     fetched = _fetched(node)
@@ -375,14 +378,18 @@ def test_node_exchange_gathers_across_processes_without_a_group():
 @pytest.mark.parametrize("in_place", [True, False], ids=["in-place", "mirrors-only"])
 @pytest.mark.parametrize("permuted", [False, True], ids=["as-loaded", "permuted"])
 @pytest.mark.parametrize("rails", [[0, 1], [0, 5]])
-def test_node_sync_reads_every_row(mori, monkeypatch, rails, permuted, in_place):
+@pytest.mark.parametrize("pack", [True, False], ids=["packed", "unpacked"])
+def test_node_sync_reads_every_row(mori, monkeypatch, rails, permuted, in_place, pack):
     """With ``permuted``, vLLM transposes ``d0`` (64 x 64 bytes) after loading: the
     reader stages it and moves it into place, as on one node, its bytes fetched
     straight into the staging slot. Otherwise source 0 lands straight in ``d0``.
-    With in-place landing off, both go through the mirror."""
+    With in-place landing off, both go through the mirror. With ``pack``, mirrors
+    hold their strided reads contiguously once landed."""
     monkeypatch.setattr(mn, "_rails", lambda sources, exchange, device: (
         {s.src_rank: s.rail for s in sources}, list(rails)))
     monkeypatch.setenv("LUMEN_MORI_RDMA_IN_PLACE", "1" if in_place else "0")
+    monkeypatch.setenv("LUMEN_MORI_NODE_PACK", "1" if pack else "0")
+    monkeypatch.setenv("LUMEN_MORI_SLOW_SYNC_S", "0")
     monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda: [])
     gen = torch.Generator().manual_seed(0)
     src = {q: torch.randint(0, 255, (n,), dtype=torch.uint8, generator=gen).cuda()
@@ -406,7 +413,7 @@ def test_node_sync_reads_every_row(mori, monkeypatch, rails, permuted, in_place)
             r = MoriNodeReader(plan, d, params[d], exports, group=[0, 1], host="h",
                                exchange=group.exchange(d), signal_key=key, window=2,
                                batch=_BIG)
-            _TENSORS.extend([r.mirror, *r.reader.slots])
+            _TENSORS.extend([r.mirror, *r.reader.slots, r.reader.unstage_buf])
             readers[d] = r
             for _ in range(2):  # trainer weights change between syncs
                 group.barrier.wait()
@@ -514,3 +521,90 @@ def test_node_sync_stages_checkpoint_tensors_for_load(mori, monkeypatch, direct)
     assert readers[0].checkpoint and readers[0].land_bytes == 0
     assert readers[0].stage_bytes == (4096 if direct else 0)
     assert readers[1].in_bytes > 0
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
+@pytest.mark.parametrize("fault", ["none", "late", "lost"])
+def test_node_debug_finds_bytes_written_after_completion(mori, monkeypatch, caplog, fault):
+    """``LUMEN_MORI_NODE_DEBUG``: the mirror bytes of the first batch that owns a chunk
+    are overwritten with the sentinel as the batch completes. ``late``: they come back
+    5 ms later, before the recheck, so the chunk shows as changed and the sync is
+    still right. ``lost``: they never do, and readers copy the sentinel into vLLM's
+    weights."""
+    monkeypatch.setattr(mn, "_rails", lambda sources, exchange, device: (
+        {s.src_rank: s.rail for s in sources}, [0, 1]))
+    monkeypatch.setenv("LUMEN_MORI_RDMA_IN_PLACE", "0")
+    monkeypatch.setenv("LUMEN_MORI_NODE_DEBUG", "1")
+    monkeypatch.setenv("LUMEN_MORI_NODE_DEBUG_DELAY_MS", "50")
+    monkeypatch.setattr(torch.cuda, "memory_snapshot", lambda: [])
+    gen = torch.Generator().manual_seed(2)
+    src = {q: torch.randint(0, 255, (n,), dtype=torch.uint8, generator=gen).cuda()
+           for q, n in _SRC_NB.items()}
+    for t in src.values():  # no sentinel bytes in the weights themselves
+        t[(t == mn._MIRROR_FILL) | (t == mn._SCRATCH_FILL)] = 0
+    for s, q in ((s, q) for s in (0, 1) for q in _SRC_NB if s in _HOLDERS[q]):
+        _MEMS[(s, q)] = src[q]
+    plan, exports = _plan(), _exports()
+    real = MoriNodeReader._debug_batch
+
+    def debug_batch(self, i):
+        if fault != "none" and self.debug_chunks[i] and not any(self.debug_chunks[:i]):
+            spans = [(self.node.offsets[(s, q)] + so, n)
+                     for s, q, so, n, dp, _ in self.node.fetch[self.me][i] if dp < 0]
+            saved = [self.mirror[a:a + n].clone() for a, n in spans]
+            for a, n in spans:
+                self.mirror[a:a + n].fill_(mn._MIRROR_FILL)
+            torch.cuda.synchronize()
+            if fault == "late":
+                def arrive():
+                    time.sleep(0.005)
+                    for (a, n), b in zip(spans, saved):
+                        self.mirror[a:a + n].copy_(b)
+                    torch.cuda.synchronize()
+                threading.Thread(target=arrive).start()
+        real(self, i)
+
+    monkeypatch.setattr(MoriNodeReader, "_debug_batch", debug_batch)
+    group, key = _Group(2), f"test-{os.getpid()}-{next(_ids)}"
+    readers, params, errors, rights = [None, None], [None, None], [], [None, None]
+
+    def rank(d):
+        try:
+            torch.cuda.set_device(0)
+            rows = plan.rows[plan.rows[:, 0] == d]
+            params[d] = {f"d{q}": torch.zeros(_DST_NB[q], dtype=torch.uint8, device="cuda")
+                         for q in rows[:, 3].tolist()}
+            _TENSORS.extend(params[d].values())
+            r = MoriNodeReader(plan, d, params[d], exports, group=[0, 1], host="h",
+                               exchange=group.exchange(d), signal_key=key, window=2,
+                               batch=_BIG)
+            _TENSORS.extend([r.mirror, *r.reader.slots, r.reader.unstage_buf])
+            readers[d] = r
+            group.barrier.wait()
+            r.sync()
+            group.barrier.wait()
+            rights[d] = all(torch.equal(
+                params[d][f"d{row[3]}"].as_strided((row[8], row[7]), (row[9], 1), row[4]),
+                src[row[5]].as_strided((row[8], row[7]), (row[10], 1), row[6]))
+                for row in rows.tolist())
+        except BaseException as e:  # noqa: BLE001 - re-raised in the test thread
+            errors.append(e)
+            group.barrier.abort()
+
+    with caplog.at_level("WARNING", logger=mn.__name__):
+        threads = [threading.Thread(target=rank, args=(d,)) for d in (0, 1)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+    if errors:
+        raise errors[0]
+    logs = [m for m in caplog.messages if m.startswith("MORI node debug")]
+    assert len(logs) == 2
+    faulted = sum(1 for r in readers if any(r.debug_chunks))
+    assert faulted > 0
+    assert all(rights) == (fault != "lost")
+    changed = sum(int(re.search(r"; (\d+) mirror chunks changed", m)[1]) for m in logs)
+    sentinel = sum(int(re.search(r"; (\d+) of \d+ reads from mirrors left", m)[1]) for m in logs)
+    assert changed == (faulted if fault == "late" else 0)
+    assert (sentinel > 0) == (fault == "lost")

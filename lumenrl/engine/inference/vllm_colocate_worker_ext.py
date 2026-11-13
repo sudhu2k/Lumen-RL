@@ -452,10 +452,9 @@ class vLLMColocateWorkerExtension:
         (-1 if unknown)."""
         from vllm.distributed import parallel_state
 
-        from lumenrl.transfer.rail_topology import gpu_rail, pin_own_nic
+        from lumenrl.transfer.rail_topology import gpu_rail
 
         world_group = parallel_state.get_world_group()
-        pin_own_nic(torch.cuda.current_device())
         topo = gpu_rail(torch.cuda.current_device())
         return {"dst_rank": int(replica) * int(world_group.world_size)
                 + int(world_group.rank_in_group),
@@ -543,9 +542,6 @@ class vLLMColocateWorkerExtension:
             import torch.distributed as dist
 
             from lumenrl.transfer.mori_node import MoriNodeReader, NodeExchange
-            from lumenrl.transfer.rail_topology import pin_own_nic
-
-            pin_own_nic(torch.cuda.current_device())
 
             if not host:
                 raise ValueError("cross-node MORI weight sync needs this node's address")
