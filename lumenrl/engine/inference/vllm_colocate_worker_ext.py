@@ -472,7 +472,7 @@ class vLLMColocateWorkerExtension:
             logger.warning(
                 "MORI reads rollout rank %d's buffers (GPU %s) through %s, not the GPU's own "
                 "%s: MORI matches NICs to GPUs by visible-device position (%s). Listing the "
-                "node's GPUs in bus order puts every rank on its own NIC.",
+                "node's GPUs in device order puts every rank on its own NIC.",
                 dst_rank, topo.bus, topo.nic, topo.own_nic, visible_order(),
             )
         return {"nic": topo.nic, "own_nic": topo.own_nic, "gpu_bus": topo.bus}

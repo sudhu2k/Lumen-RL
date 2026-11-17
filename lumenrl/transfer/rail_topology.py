@@ -7,7 +7,8 @@ earlier GPU took (fastest, then on the GPU's NUMA node, then fewest PCIe hops, t
 name). A reader's NIC therefore follows its device's position in ``*_VISIBLE_DEVICES``,
 not which physical GPU it is; with ``MORI_IO_RAIL_AFFINITY=1`` the passive side answers
 on the NIC with the same index. A GPU's own NIC is the one that match gives it with
-every GPU of the node visible in bus order; a NIC reading another GPU's memory crosses
+every GPU of the node visible, in the order HIP numbers them: KFD topology node order,
+which can differ from PCI bus order. A NIC reading another GPU's memory crosses
 the host's PCIe fabric, which hypervisors may hide (all devices under one root).
 MORI builds whose matcher pairs NICs over every GPU of the host and then looks up the
 visible ones give each GPU its own NIC; ``LUMEN_MORI_NIC_MATCH=node`` says MORI is one.
@@ -118,11 +119,35 @@ def _nics(root: str) -> list[Nic]:
     return out
 
 
+def _kfd_nodes(root: str) -> dict[str, int]:
+    """The KFD topology node of every GPU of the host, by PCI address."""
+    base = os.path.join(root, "sys/class/kfd/kfd/topology/nodes")
+    out = {}
+    for node in os.listdir(base) if os.path.isdir(base) else ():
+        d = os.path.join(base, node)
+        if not node.isdigit() or _read(os.path.join(d, "gpu_id"), "0") in ("", "0"):
+            continue
+        props = {}
+        for line in _read(os.path.join(d, "properties")).splitlines():
+            kv = line.split()
+            if len(kv) == 2:
+                props[kv[0]] = kv[1]
+        if "location_id" not in props:
+            continue
+        loc, dom = int(props["location_id"]), int(props.get("domain", "0"))
+        out[f"{dom:04x}:{(loc >> 8) & 0xff:02x}:{(loc >> 3) & 0x1f:02x}.{loc & 7:x}"] = int(node)
+    return out
+
+
 def _node_gpus(root: str) -> list[str]:
+    """Every GPU of the node in HIP's device order: by KFD node, which MORI's host-wide
+    NIC match also walks; GPUs KFD doesn't list (or no KFD sysfs) after, by address."""
     base = os.path.join(root, "sys/bus/pci/devices")
-    return sorted(b for b in (os.listdir(base) if os.path.isdir(base) else ())
-                  if _read(os.path.join(base, b, "vendor")) == _AMD
-                  and _read(os.path.join(base, b, "class")).startswith(_GPU_CLASSES))
+    kfd = _kfd_nodes(root)
+    gpus = [b for b in (os.listdir(base) if os.path.isdir(base) else ())
+            if _read(os.path.join(base, b, "vendor")) == _AMD
+            and _read(os.path.join(base, b, "class")).startswith(_GPU_CLASSES)]
+    return sorted(gpus, key=lambda b: (b not in kfd, kfd.get(b, 0), b))
 
 
 def _visible_gpus() -> list[str]:

@@ -594,7 +594,7 @@ class VLLMReplicaManager:
         mirroring ATOMReplicaManager's grouping logic.
 
         With ``gpu_order_wg`` (trainers on other nodes), a replica's GPUs are visible
-        in bus order: MORI picks a GPU's NIC by its visible-device position, so only
+        in device order: MORI picks a GPU's NIC by its visible-device position, so only
         that order reads each rank's buffers through its GPU's own NIC. The readers
         plan around wherever the trainer ranks run (``rail_topology``).
         """
@@ -632,8 +632,9 @@ class VLLMReplicaManager:
             # which is what makes the sender's rank % tp the receiver's local_rank.
             gpu_ids = [str(g) for info in group for g in info["gpu_ids"]]
             if order is not None:
-                # MORI gives the i-th visible GPU the i-th best free NIC, so only bus
-                # order puts each rank on its GPU's own NIC (rail_topology).
+                # MORI gives the i-th visible GPU the i-th best free NIC, so only device
+                # order (KFD node order, not always bus order) puts each rank on its
+                # GPU's own NIC (rail_topology).
                 gpu_ids = sorted(gpu_ids, key=int)
                 want = [str(g) for info in order[r * tp:(r + 1) * tp] for g in info["gpu_ids"]]
                 logger.info("VLLMReplicaManager: replica %d ranks 0..%d on GPUs %s; trainer "

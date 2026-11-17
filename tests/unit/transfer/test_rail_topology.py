@@ -95,6 +95,54 @@ def _sysfs(root, gpus, nics):
         (ib / "ports/1/rate").write_text("400 Gb/sec (4X NDR)\n")
 
 
+def _kfd(root, buses):
+    """KFD topology nodes: two CPU nodes, then the GPUs at ``buses`` in that order."""
+    base = root / "sys/class/kfd/kfd/topology/nodes"
+    for node in range(len(buses) + 2):
+        d = base / str(node)
+        d.mkdir(parents=True)
+        bus = buses[node - 2] if node >= 2 else None
+        (d / "gpu_id").write_text(f"{1000 + node if bus else 0}\n")
+        if bus is None:
+            (d / "properties").write_text("cpu_cores_count 64\nlocation_id 0\ndomain 0\n")
+            continue
+        dom, b, df = bus.split(":")
+        dev, fn = df.split(".")
+        loc = int(b, 16) << 8 | int(dev, 16) << 3 | int(fn, 16)
+        (d / "properties").write_text(
+            f"cpu_cores_count 0\nsimd_count 1024\nlocation_id {loc}\ndomain {int(dom, 16)}\n")
+
+
+def test_node_gpus_follow_kfd_order_not_bus_order(tmp_path):
+    buses = ["0000:05:00.0", "0000:15:00.0", "0000:65:00.0", "0000:75:00.0"]
+    _sysfs(tmp_path, [(b, 0) for b in buses], [])
+    root = str(tmp_path)
+    assert rt._node_gpus(root) == buses                              # no KFD sysfs
+    _kfd(tmp_path, ["0000:75:00.0", "0000:05:00.0", "0000:65:00.0"])  # 15 not listed
+    assert rt._kfd_nodes(root) == {"0000:75:00.0": 2, "0000:05:00.0": 3, "0000:65:00.0": 4}
+    assert rt._node_gpus(root) == ["0000:75:00.0", "0000:05:00.0", "0000:65:00.0",
+                                   "0000:15:00.0"]
+
+
+def test_kfd_order_decides_the_own_nic_when_hops_tie(monkeypatch):
+    monkeypatch.setenv("LUMEN_MORI_NIC_MATCH", "node")
+    gpus, nics, paths, numa = _flat()
+    kfd_order = [gpus[i] for i in (1, 0, 2, 3, 5, 4, 6, 7)]
+    r = rails_of(nics, gpus[1], [gpus[1]], kfd_order, paths, numa)
+    assert (r.nic, r.own_nic) == ("ionic_0", "ionic_0")
+    r = rails_of(nics, gpus[1], [gpus[1]], gpus, paths, numa)        # bus order
+    assert (r.nic, r.own_nic) == ("ionic_1", "ionic_1")
+
+
+def test_kfd_nodes_cover_this_hosts_gpus():
+    kfd = rt._kfd_nodes("/")
+    if not kfd:
+        pytest.skip("KFD sysfs lists no GPUs (no /dev/kfd in this container, or no GPUs)")
+    gpus = rt._node_gpus("/")
+    assert set(kfd) <= set(gpus)
+    assert gpus[:len(kfd)] == sorted(kfd, key=kfd.get)
+
+
 def test_gpu_rail_reads_sysfs(tmp_path, monkeypatch):
     gpus = [("0002:00:01.0", 0), ("0002:00:02.0", 0)]
     _sysfs(tmp_path, gpus, [("ionic_0", "0002:00:09.0", 0, "4: ACTIVE"),
