@@ -37,10 +37,21 @@ python3 -c "import apex; print('apex ok')"
 git clone https://github.com/ROCm/TransformerEngine.git "$SRC/te"
 git -C "$SRC/te" checkout "$TE_SHA"
 git -C "$SRC/te" submodule update --init --recursive --jobs 16
+# TheRock ld.lld rejects QoLA version-script RTTI wildcards
+# ("typeinfo for qola::*"). Strip those lines when requested (ROCm 10.3 image).
+if [ "${TE_STRIP_QOLA_TYPEINFO_LDS:-0}" = "1" ]; then
+  LDS="$SRC/te/3rdparty/QoLA/qola/cpp_itfs/qola_exports.lds"
+  if [ -f "$LDS" ]; then
+    sed -i '/typeinfo for qola/d;/typeinfo name for qola/d' "$LDS"
+    echo "stripped QoLA typeinfo exports from $LDS"
+  fi
+fi
 cd "$SRC/te"
 export NVTE_FRAMEWORK=pytorch NVTE_USE_ROCM=1
 export NVTE_ROCM_ARCH="$ARCH" PYTORCH_ROCM_ARCH="$ARCH"
-export NVTE_FUSED_ATTN=1 NVTE_FUSED_ATTN_CK=1 NVTE_FUSED_ATTN_AOTRITON=1
+export NVTE_FUSED_ATTN=${NVTE_FUSED_ATTN:-1}
+export NVTE_FUSED_ATTN_CK=${NVTE_FUSED_ATTN_CK:-1}
+export NVTE_FUSED_ATTN_AOTRITON=${NVTE_FUSED_ATTN_AOTRITON:-1}
 export MAX_JOBS=${MAX_JOBS:-48}
 # ROCm 7.2's hipcc -v exits 1 when given no input file and the CK-JIT compiler
 # ABI probe reads that as "compiler unusable". The probe is not load-bearing.

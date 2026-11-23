@@ -481,6 +481,8 @@ class RLTrainer:
             quant_cfg = vllm_quantization_config(engine_kwargs["quantization"])
             if quant_cfg is not None:
                 engine_kwargs["quantization_config"] = quant_cfg
+        if bool(getattr(vcfg, "enable_expert_parallel", False)):
+            engine_kwargs["enable_expert_parallel"] = True
         if self._r3_rollout_replay:
             # makes the engine attach the selected expert ids to every completion
             engine_kwargs["enable_return_routed_experts"] = True
@@ -514,6 +516,8 @@ class RLTrainer:
                 timeout_s=int(self.config.weight_sync.timeout_s),
                 group_name=group_name,
             )
+        elif weight_backend == "siphon":
+            self._init_siphon_weight_sync(mgr)
         logger.info(
             "Ray vLLM rollout ready: %d replicas (TP=%d, separation=%s, weight_sync=%s).",
             mgr.num_replicas, tp,
@@ -799,6 +803,57 @@ class RLTrainer:
         tp = int(getattr(mgr, "tensor_parallel_size", 1) or 1)
         return bool(getattr(self, "_ray_use_vllm", False)) and replicas * tp == workers
 
+    def _init_siphon_weight_sync(self, mgr) -> None:
+        """Register trainer sources and vLLM sinks through ``siphon.session``."""
+        import asyncio
+
+        from siphon.session import Session, resolve_plan
+
+        from lumenrl.transfer.siphon_bridge import (
+            LumenDispatcher,
+            megatron_engine_config_from_config,
+            require_siphon,
+            vllm_engine_kwargs_from_config,
+        )
+
+        require_siphon()
+        cfg = self.config.weight_sync.siphon
+        plan_path = resolve_plan(
+            plan=str(cfg.plan), plan_cache_dir=str(cfg.plan_cache_dir),
+            model_dir=str(self.config.policy.model_name),
+            trainer=("megatron", megatron_engine_config_from_config(self.config)),
+            rollout=("vllm", vllm_engine_kwargs_from_config(self.config)),
+            n_trainer=int(self._actor_wg.num_workers), n_vllm=int(mgr.num_replicas),
+        )
+        self._siphon_loop = asyncio.new_event_loop()
+        self._siphon = Session(
+            LumenDispatcher(self._actor_wg, mgr.servers), int(mgr.num_replicas),
+            plan_path=plan_path, window=int(cfg.window),
+            num_streams=int(cfg.num_streams), strided=bool(cfg.strided),
+        )
+        check = bool(cfg.startup_check) and int(getattr(self, "_resume_step", 0) or 0) == 0
+        info = self._siphon_loop.run_until_complete(self._siphon.init(check=check))
+        logger.info(
+            "siphon weight sync ready in %.2fs: %d trainer ranks, %d rollout ranks over %s, plan %s",
+            info["ready_s"], info["n_src"], info["n_dst"], "+".join(info["transports"]), plan_path,
+        )
+        if check:
+            logger.info("siphon startup check passed (%.3fs)", info["check_s"])
+
+    def _sync_weights_siphon(self, mgr) -> None:
+        """One siphon pull after the optimizer step."""
+        import ray
+
+        stats = self._siphon_loop.run_until_complete(self._siphon.sync(
+            int(self.global_step) + 1, verify=bool(self.config.weight_sync.siphon.verify)))
+        # Cached prefixes were computed with the old weights.
+        ray.get([s.reset_prefix_cache.remote() for s in mgr.servers])
+        self._last_weight_sync_metrics = {
+            "timing/weight_sync_siphon_s": stats["sync_s"],
+            "timing/weight_sync_siphon_transfer_s": stats["transfer_s"],
+            "weight_sync/backend_siphon": 1.0,
+        }
+
     def _sync_weights_ipc(self) -> None:
         """verl-aligned weight sync: wake weights -> ZMQ IPC -> wake KV cache.
 
@@ -823,10 +878,13 @@ class RLTrainer:
         if backend == "shared_folder":
             self._sync_weights_safetensors(mgr)
             return
+        if backend == "siphon":
+            self._sync_weights_siphon(mgr)
+            return
         if backend != "auto":
             raise ValueError(
                 f"Unsupported weight_sync.backend={backend!r}; "
-                "expected auto, shared_folder, or rdma"
+                "expected auto, shared_folder, rdma, or siphon"
             )
 
         fp8_sync = self.config.weight_sync.resolve_fp8_quantize()

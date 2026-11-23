@@ -1,0 +1,244 @@
+# LumenRL on ROCm 10.3 / TheRock (frameworks-internal).
+#
+# Why this exists:
+#   The validated release image (release/Dockerfile) sits on
+#   vllm/vllm-openai-rocm:v0.23.0 (ROCm 7.2). We need the ROCm 10.3
+#   frameworks-internal stack so ROCr peer-engine RECT
+#   (hsa_amd_memory_async_copy_rect / hipMemcpy3DBatchAsync lineage, commit
+#   90ddc8a) is present for siphon/MORI strided XGMI work.
+#
+# Base already has:
+#   Ubuntu 24.04, Python 3.12, torch 2.13+rocm10.3, triton, TheRock ROCm SDK
+#   (rocm-sdk), gfx942 + gfx950 device wheels. No vLLM, Ray, Lumen, or RDMA -dev pkgs.
+#   Fat image: pass PYTORCH_ROCM_ARCH=gfx942;gfx950 (semicolon-separated).
+#
+# Important: do NOT `pip install vllm` from https://wheels.vllm.ai/rocm/ —
+# those rocm100 wheels bundle their own TheRock/torch and would replace this
+# base. Build vLLM from source against the existing torch (vLLM ROCm "Full
+# build" docs).
+#
+# Build:  bash release/build_image_rocm10.3.sh
+#         (defaults: vLLM + MORI sudhu/siphon + ROCm Megatron/Apex/TE)
+# Fast:   WITH_MEGATRON=0 bash release/build_image_rocm10.3.sh
+
+ARG BASE_IMAGE=rocm/frameworks-internal:rocm10.3.0a20261119_ubuntu24.04_py3.12_pytorch_2.13.0_d9a3194
+FROM ${BASE_IMAGE}
+
+# Semicolon-separated for fat binaries (MORI/aiter/vLLM). Example: gfx942;gfx950
+ARG PYTORCH_ROCM_ARCH=gfx950
+ARG LUMENRL_REPO
+ARG LUMENRL_BRANCH
+ARG LUMEN_REPO
+ARG LUMEN_BRANCH
+ARG LUMEN_SHA
+ARG AITER_REPO
+ARG AITER_BRANCH
+ARG AITER_SHA
+ARG ATOM_REPO
+ARG ATOM_BRANCH
+ARG ATOM_SHA
+ARG VLLM_REPO=https://github.com/vllm-project/vllm.git
+ARG VLLM_SHA
+ARG MORI_REPO=https://github.com/ROCm/mori.git
+ARG MORI_SHA=
+ARG MEGATRON_REPO=https://github.com/ROCm/Megatron-LM.git
+ARG MEGATRON_SHA=
+ARG APEX_SHA=daed85255d51476425080e7e6203f0bee6d7e4cc
+ARG TE_SHA=6e541a10419a6e31bdc98b1516db04eb81a463b6
+ARG FLYDSL_VERSION=0.3.2
+ARG WITH_MEGATRON=1
+ARG WITH_VLLM=1
+ARG WITH_MORI=1
+
+ENV RL_ROOT=/opt/lumenrl \
+    LUMEN_DIR=/opt/lumenrl/Lumen \
+    AITER_DIR=/opt/lumenrl/aiter \
+    ATOM_DIR=/opt/lumenrl/ATOM \
+    VLLM_DIR=/opt/lumenrl/vllm \
+    MORI_DIR=/opt/lumenrl/mori \
+    MEGATRON_DIR=/opt/lumenrl/Megatron-LM \
+    PYTORCH_ROCM_ARCH=${PYTORCH_ROCM_ARCH} \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH} \
+    DEBIAN_FRONTEND=noninteractive \
+    # TheRock layout: devel links + PATH come from `rocm-sdk init` (see below).
+    # Keep these ENV so docker exec / non-login shells still see HIP.
+    ROCM_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel \
+    ROCM_HOME=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel \
+    HIP_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel
+
+SHELL ["/bin/bash", "-lc"]
+
+# ------------------------------------------------ system deps (apt / ROCm) ----
+# Ubuntu packages for build + RDMA userspace. Ionic NIC libs stay host-mounted
+# on Crusoe; we only need the generic verbs/rdmacm headers and runtime here.
+# Ref: ROCm / vLLM install pages (cmake, ninja, pybind11, amd_smi from SDK).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential ca-certificates curl wget git cmake ninja-build \
+      pkg-config python3-dev \
+      libnuma-dev libssl-dev zlib1g-dev \
+      rdma-core libibverbs1 libibverbs-dev librdmacm1 librdmacm-dev \
+      ibverbs-providers ibverbs-utils rdmacm-utils \
+      libpci-dev pciutils \
+      libdrm-dev libdrm2 libdrm-amdgpu1 \
+      python3-venv python3.12-venv \
+    && rm -rf /var/lib/apt/lists/*
+
+# Initialise TheRock devel symlinks and point builds at the pip ROCm SDK.
+# Docs: `rocm-sdk init` then ROCM_PATH=$(rocm-sdk path --root).
+# ROCm 10.3 ships amdsmi as a plain package tree under share/amd_smi (no
+# setup.py) — expose it via PYTHONPATH instead of `pip install`.
+RUN rocm-sdk init \
+ && SDK_ROOT="$(rocm-sdk path --root)" \
+ && SDK_CORE="$(python3 -c 'import _rocm_sdk_core, os; print(os.path.dirname(_rocm_sdk_core.__file__))')" \
+ && echo "ROCM_PATH=${SDK_ROOT}" \
+ && ln -sfn "${SDK_ROOT}" /opt/rocm \
+ && PYTHONPATH="${SDK_CORE}/share/amd_smi:${PYTHONPATH:-}" \
+      python3 -c "import amdsmi; print('amdsmi ok', amdsmi.__file__)"
+
+# aiter's get_gfx_runtime() always shells out to rocminfo (ignores GPU_ARCHS).
+# docker build has no GPU, so shadow rocminfo with one agent per arch in
+# PYTORCH_ROCM_ARCH ahead of the SDK bin on PATH. Runtime containers with real
+# GPUs still see the real binary if /opt/lumenrl/bin is dropped from PATH;
+# keep the stub for image build imports (Megatron/Apex pull aiter at import).
+RUN mkdir -p /opt/lumenrl/bin \
+ && python3 -c "raw='${PYTORCH_ROCM_ARCH}'; archs=[a for a in raw.replace(',',';').replace(' ',';').split(';') if a]; lines=['#!/bin/sh','# Build-time stub for aiter chip_info (no GPU in docker build).','# Arches: '+' '.join(archs)]; \
+     [lines.extend(['echo \"Agent %d\"' % i, 'echo \"  Name:                    %s\"' % a, 'echo \"  Device Type:             GPU\"', 'echo \"  ASIC Revision:           1\"']) for i,a in enumerate(archs,1)]; \
+     open('/opt/lumenrl/bin/rocminfo','w').write(chr(10).join(lines)+chr(10)); print('rocminfo stub arches:', archs)" \
+ && chmod +x /opt/lumenrl/bin/rocminfo
+
+ENV PATH=/opt/lumenrl/bin:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/bin:${PATH} \
+    LD_LIBRARY_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/rocm_sysdeps/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib/rocm_sysdeps/lib:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/lib \
+    CMAKE_PREFIX_PATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_devel/lib/rocm_sysdeps \
+    PYTHONPATH=/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/share/amd_smi \
+    GPU_ARCHS=${PYTORCH_ROCM_ARCH}
+
+# ---------------------------------------------------------------- sources ----
+RUN mkdir -p "$RL_ROOT" && git config --global --add safe.directory '*'
+
+RUN git init "$RL_ROOT/aiter" \
+ && cd "$RL_ROOT/aiter" \
+ && git remote add origin "${AITER_REPO}" \
+ && git fetch --depth 1 origin "${AITER_SHA}" \
+ && git checkout FETCH_HEAD \
+ && git submodule update --init --depth 1 3rdparty/composable_kernel
+
+RUN git init "$RL_ROOT/Lumen" \
+ && cd "$RL_ROOT/Lumen" \
+ && git remote add origin "${LUMEN_REPO}" \
+ && git fetch --depth 1 origin "${LUMEN_SHA}" \
+ && git checkout FETCH_HEAD
+
+RUN git init "$RL_ROOT/ATOM" \
+ && cd "$RL_ROOT/ATOM" \
+ && git remote add origin "${ATOM_REPO}" \
+ && git fetch --depth 1 origin "${ATOM_SHA}" \
+ && git checkout FETCH_HEAD
+
+RUN git init "$RL_ROOT/Lumen-RL" \
+ && cd "$RL_ROOT/Lumen-RL" \
+ && git remote add origin "${LUMENRL_REPO}" \
+ && git fetch --depth 1 origin "${LUMENRL_BRANCH}" \
+ && git checkout FETCH_HEAD
+
+# ----------------------------------------------------------- python deps ----
+# Base image ships Debian pip/wheel without RECORD files; --ignore-installed
+# overlays them instead of trying to uninstall.
+RUN pip install --no-cache-dir --upgrade --ignore-installed pip setuptools wheel \
+ && pip install --no-cache-dir "flydsl==${FLYDSL_VERSION}"
+
+RUN pip install --no-cache-dir \
+      "ray[default]>=2.9" "accelerate>=0.28" datasets \
+      "math_verify[antlr4_13_2]" "omegaconf>=2.3,<2.4" safetensors wandb \
+      psutil ninja pybind11 einops pandas packaging
+
+# Editable installs so a bind-mounted checkout over any of these paths keeps
+# working without reinstalling. Keep system triton from the base image.
+RUN cd "$AITER_DIR" && AITER_USE_SYSTEM_TRITON=1 python3 setup.py develop \
+ && pip install --no-cache-dir -e "$LUMEN_DIR" --no-deps \
+ && pip install --no-cache-dir -e "$RL_ROOT/Lumen-RL" --no-deps
+
+# ------------------------------------------------------------------- vLLM ----
+# Full source build against the base torch/ROCm. `pip install .` is unsupported
+# on ROCm; use setup.py develop (vLLM ROCm install docs).
+RUN if [ "${WITH_VLLM}" = "1" ]; then \
+      git init "$VLLM_DIR" \
+   && cd "$VLLM_DIR" \
+   && git remote add origin "${VLLM_REPO}" \
+   && git fetch --depth 1 origin "${VLLM_SHA}" \
+   && git checkout FETCH_HEAD \
+   && pip install --no-cache-dir -r requirements/rocm.txt \
+   && PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" python3 setup.py develop \
+   && python3 -c "import vllm; print('vllm', vllm.__version__)"; \
+    fi
+
+# -------------------------------------------------------------------- MORI ----
+# Optional. CMAKE_PREFIX_PATH must include rocm_sysdeps (NUMA etc.) per docs.
+RUN if [ "${WITH_MORI}" = "1" ]; then \
+      test -n "${MORI_SHA}" || { echo "WITH_MORI=1 requires MORI_SHA" >&2; exit 1; }; \
+      git init "$MORI_DIR" \
+   && cd "$MORI_DIR" \
+   && git remote add origin "${MORI_REPO}" \
+   && git fetch --depth 1 origin "${MORI_SHA}" \
+   && git checkout FETCH_HEAD \
+   && git submodule update --init --recursive --depth 1 \
+   && pip install --no-cache-dir "setuptools_scm>=6.2" \
+   && SYSDEPS="${ROCM_PATH}/lib/rocm_sysdeps" \
+   && export CMAKE_PREFIX_PATH="${ROCM_PATH}:${SYSDEPS}" \
+             PKG_CONFIG_PATH="${SYSDEPS}/lib/pkgconfig:${PKG_CONFIG_PATH:-}" \
+             LIBRARY_PATH="${SYSDEPS}/lib:${LIBRARY_PATH:-}" \
+             LD_LIBRARY_PATH="${SYSDEPS}/lib:${LD_LIBRARY_PATH:-}" \
+             MORI_GPU_ARCHS="${PYTORCH_ROCM_ARCH}" \
+   && python3 setup.py install \
+   && python3 -c "import mori; print('mori ok')"; \
+    fi
+
+# --------------------------------------- ROCm Megatron-LM / Apex / TE --------
+# Never install PyPI megatron-core or transformer_engine — those are NVIDIA
+# builds (no MORI flex dispatcher; TE fails on import with undefined symbols).
+# Megatron: ROCm/Megatron-LM (core_r0.18.0_rocm). Apex/TE: ROCm forks via
+# build_apex_te.sh. MEGATRON_PATH is set so run_dapo prepends this tree.
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
+      test -n "${MEGATRON_SHA}" || { echo "WITH_MEGATRON=1 requires MEGATRON_SHA" >&2; exit 1; }; \
+      git init "$MEGATRON_DIR" \
+   && cd "$MEGATRON_DIR" \
+   && git remote add origin "${MEGATRON_REPO}" \
+   && git fetch --depth 1 origin "${MEGATRON_SHA}" \
+   && git checkout FETCH_HEAD \
+   && pip install --no-cache-dir -e "$MEGATRON_DIR" --no-deps \
+   && GPU_ARCHS="${PYTORCH_ROCM_ARCH}" \
+      python3 -c "import megatron.core; print('megatron.core', megatron.core.__file__)" \
+   && echo "export MEGATRON_PATH=$MEGATRON_DIR" > /etc/profile.d/lumenrl-megatron.sh \
+   && echo "MEGATRON_PATH=$MEGATRON_DIR" >> /etc/environment; \
+    fi
+
+COPY build_apex_te.sh /tmp/build_apex_te.sh
+# TheRock ld.lld rejects QoLA's `typeinfo for qola::*` version-script entries
+# (unset CXX alone does not fix it). Strip those lines; keep CK fused-attn on.
+RUN if [ "${WITH_MEGATRON}" = "1" ]; then \
+      export APEX_SHA="${APEX_SHA}" TE_SHA="${TE_SHA}" \
+             PYTORCH_ROCM_ARCH="${PYTORCH_ROCM_ARCH}" \
+             MEGATRON_PATH="${MEGATRON_DIR}" \
+             PYTHONPATH="${MEGATRON_DIR}:${PYTHONPATH:-}" \
+             NVTE_FUSED_ATTN=1 NVTE_FUSED_ATTN_CK=1 NVTE_FUSED_ATTN_AOTRITON=1 \
+             TE_STRIP_QOLA_TYPEINFO_LDS=1; \
+      unset CXX CC CXXFLAGS CFLAGS CMAKE_CXX_COMPILER CMAKE_C_COMPILER || true; \
+      bash /tmp/build_apex_te.sh; \
+    fi
+
+# ------------------------------------------------- vLLM RMSNorm patch --------
+COPY patch_vllm_aiter_rmsnorm.py /opt/lumenrl/patch_vllm_aiter_rmsnorm.py
+RUN if [ "${WITH_VLLM}" = "1" ]; then \
+      python3 /opt/lumenrl/patch_vllm_aiter_rmsnorm.py || \
+      echo "WARN: vLLM AITER RMSNorm patch skipped (API may have moved)"; \
+    fi
+
+COPY entrypoint.sh /opt/lumenrl/entrypoint.sh
+RUN chmod +x /opt/lumenrl/entrypoint.sh
+
+# Entrypoint auto-detects $RL_ROOT/Megatron-LM when WITH_MEGATRON baked it in.
+ENV PYTHONPATH=/opt/lumenrl/Lumen-RL:/opt/lumenrl/aiter:/opt/lumenrl/Lumen:/usr/local/lib/python3.12/dist-packages/_rocm_sdk_core/share/amd_smi \
+    AITER_JIT_DIR=/opt/lumenrl/aiter-jit
+
+WORKDIR /opt/lumenrl/Lumen-RL
+ENTRYPOINT ["/opt/lumenrl/entrypoint.sh"]
+CMD ["sleep", "infinity"]

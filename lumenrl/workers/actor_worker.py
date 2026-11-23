@@ -1539,6 +1539,24 @@ class LumenActorWorker(BaseWorker):
             **{f"sender_{k}": float(v) for k, v in sender.stats.items()},
         }
 
+    def siphon_call(self, fn: str, kw: dict | None = None) -> Any:
+        """Trainer-rank target of ``weight_sync.backend=siphon`` (rocm-siphon)."""
+        from siphon import runtime
+
+        def side():
+            from siphon.adapters.trainers.megatron.adapter import MegatronChunksSide
+
+            if self._engine is None or getattr(self._engine, "module", None) is None:
+                raise RuntimeError(
+                    "weight_sync.backend=siphon needs policy.training_backend=megatron_native"
+                )
+            return MegatronChunksSide(
+                self._engine.module, self.rank,
+                local_gpu=int(getattr(self, "local_rank", self.rank)), n_trainer=self.world_size,
+            )
+
+        return runtime.trainer_call(fn, kw, side=side, rank=self.rank, world=self.world_size)
+
     def cleanup(self) -> None:
         self._engine = None
         if torch.cuda.is_available():

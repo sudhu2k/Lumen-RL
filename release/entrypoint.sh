@@ -12,7 +12,16 @@ RL_ROOT=${RL_ROOT:-/opt/lumenrl}
 export LUMEN_DIR=${LUMEN_DIR:-$RL_ROOT/Lumen}
 export AITER_DIR=${AITER_DIR:-$RL_ROOT/aiter}
 export ATOM_DIR=${ATOM_DIR:-$RL_ROOT/ATOM}
-export PYTHONPATH="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR:${PYTHONPATH:-}"
+# ROCm Megatron-LM tree (baked when WITH_MEGATRON=1). Prefer an explicit
+# MEGATRON_PATH; otherwise use the image default if the checkout exists.
+if [ -z "${MEGATRON_PATH:-}" ] && [ -d "$RL_ROOT/Megatron-LM/megatron" ]; then
+  export MEGATRON_PATH=$RL_ROOT/Megatron-LM
+fi
+_PP="$RL_ROOT/Lumen-RL:$AITER_DIR:$LUMEN_DIR"
+if [ -n "${MEGATRON_PATH:-}" ] && [ -d "$MEGATRON_PATH" ]; then
+  _PP="$MEGATRON_PATH:$_PP"
+fi
+export PYTHONPATH="$_PP:${PYTHONPATH:-}"
 
 # HIP's allocator has no expandable_segments; leaving it set makes the trainer
 # fail in ways that point at the model rather than at the allocator.

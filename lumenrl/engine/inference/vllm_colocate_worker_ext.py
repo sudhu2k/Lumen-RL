@@ -448,6 +448,12 @@ class vLLMColocateWorkerExtension:
         return True
 
 
+    def siphon_call(self, fn: str, kw: dict | None = None) -> object:
+        """Rollout-rank target of ``weight_sync.backend=siphon`` (rocm-siphon)."""
+        from siphon.adapters.rollouts.vllm_worker import SiphonVllmWorkerMixin
+
+        return SiphonVllmWorkerMixin.siphon_call(self, fn, kw)
+
     def update_weights_from_ipc(
         self,
         use_shm: bool = False,

@@ -262,6 +262,9 @@ class VLLMConfig:
     can use vLLM for inference + Lumen FSDP for training without verl.
     """
     tensor_parallel_size: int = 1
+    # vLLM `enable_expert_parallel`: whole experts split across the TP ranks
+    # (MoE EP). Needed for siphon/MORI plans with rollout EP (e.g. v8e).
+    enable_expert_parallel: bool = False
     kv_cache_dtype: str = "auto"
     max_model_len: Optional[int] = None
     gpu_memory_utilization: float = 0.6
@@ -799,13 +802,30 @@ class RDMAWeightSyncConfig:
 
 
 @dataclass
+class SiphonWeightSyncConfig:
+    """Pull over siphon (MORI-IO): rollout ranks read a cached plan from the trainers.
+
+    Requires the ``rocm-siphon`` package. BF16 Megatron-native DDP trainers and vLLM.
+    """
+
+    # plan.pt, or "auto": built at startup by siphon and cached under plan_cache_dir.
+    plan: str = "auto"
+    plan_cache_dir: str = "~/.cache/siphon/weight_plans"
+    window: int = 2
+    num_streams: int = 64
+    strided: bool = True
+    startup_check: bool = True
+    verify: bool = False
+
+
+@dataclass
 class WeightSyncConfig:
     """Policy weight transport between separated training and rollout nodes."""
 
     enabled: bool = True
     # auto preserves the legacy selection; production choices are
-    # shared_folder and rdma.
-    backend: str = "auto"  # auto | shared_folder | rdma
+    # shared_folder, rdma, and siphon.
+    backend: str = "auto"  # auto | shared_folder | rdma | siphon
     shared_folder: str = "/volumes/oss1/lumenrl_weight_sync"
     bucket_size_mb: int = 1024
     timeout_s: int = 600
@@ -813,6 +833,7 @@ class WeightSyncConfig:
     fp8_quantize: bool = False  # Quantize BF16 weights to FP8 per-block before sync (halves transfer size)
     fp8_quantization_location: str | None = None  # trainer | inference; None uses legacy fp8_quantize
     rdma: RDMAWeightSyncConfig = field(default_factory=RDMAWeightSyncConfig)
+    siphon: SiphonWeightSyncConfig = field(default_factory=SiphonWeightSyncConfig)
 
     def resolve_fp8_quantize(self) -> bool:
         """Return whether weight-sync copies are quantized on the trainer."""
